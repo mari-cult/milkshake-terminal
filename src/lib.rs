@@ -7,7 +7,9 @@ use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::RenderLayers;
+use bevy::window::CompositeAlphaMode;
 use compact_str::CompactString;
+use config::TerminalConfig;
 use crossbeam_channel::{Receiver, Sender};
 use pseudo_terminal::PseudoTerminal;
 use std::io::{Read, Write};
@@ -15,6 +17,7 @@ use std::process::Command;
 use std::{io, mem, thread};
 use vte::{Intensity, NamedColor, StandardColor};
 
+mod config;
 mod convert;
 mod font;
 mod pseudo_terminal;
@@ -162,13 +165,18 @@ impl Plugin for TerminalPlugin {
 
 #[bevy_main]
 pub fn main() {
+    let terminal_config = TerminalConfig::read().unwrap();
+    let alpha = terminal_config.window.opacity.unwrap_or(1.0);
+
     App::new()
-        .insert_resource(ClearColor(Color::BLACK))
+        .insert_resource(ClearColor(Color::srgba(0.0, 0.0, 0.0, alpha)))
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     #[cfg(target_os = "android")]
                     resizable: false,
+                    transparent: terminal_config.window.opacity.is_some(),
+                    composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
                     #[cfg(target_os = "android")]
                     mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
                     recognize_rotation_gesture: true,
@@ -178,6 +186,7 @@ pub fn main() {
             }),
             TerminalPlugin,
         ))
+        .insert_resource(terminal_config)
         .add_systems(Startup, setup)
         .add_systems(Update, (setup_terminal, update, rotate_cubes))
         .run();
