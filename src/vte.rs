@@ -116,9 +116,7 @@ impl<T: VteHandler> Vte<T> {
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.parser.advance(&mut self.performer, *byte);
-        }
+        self.parser.advance(&mut self.performer, bytes);
     }
 }
 

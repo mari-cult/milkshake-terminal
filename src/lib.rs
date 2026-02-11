@@ -1,12 +1,13 @@
 use self::vte::{Vte, VteEvent};
 use bevy::asset::{embedded_asset, RenderAssetUsages};
+use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::color::palettes::basic;
 use bevy::color::Gray;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::log::debug;
 use bevy::prelude::*;
-use bevy::render::camera::RenderTarget;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::view::RenderLayers;
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use pseudo_terminal::PseudoTerminal;
@@ -294,7 +295,7 @@ fn update(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut keyboard_input: EventReader<KeyboardInput>,
+    mut keyboard_input: MessageReader<KeyboardInput>,
     mut query: Query<(Entity, &mut InternalTerminalState)>,
     terminal_fonts: Query<&TerminalFonts>,
     touch_input: Res<Touches>,
@@ -326,7 +327,7 @@ fn update(
                     if *cell_entity == Entity::PLACEHOLDER {
                         commands.entity(entity).with_children(|builder| {
                             let terminal_fonts =
-                                terminal_fonts.get(builder.parent_entity()).unwrap();
+                                terminal_fonts.get(builder.target_entity()).unwrap();
 
                             *cell_entity = new_cell(state, terminal_fonts, builder, character);
                         });
@@ -354,7 +355,7 @@ fn update(
                     let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                     if entity != Entity::PLACEHOLDER {
-                        commands.entity(entity).despawn_recursive();
+                        commands.entity(entity).despawn();
                     }
                 }
 
@@ -443,7 +444,7 @@ fn update(
                             let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                             if entity != Entity::PLACEHOLDER {
-                                commands.entity(entity).despawn_recursive();
+                                commands.entity(entity).despawn();
                             }
                         }
                     }
@@ -456,7 +457,7 @@ fn update(
                         let entity = mem::replace(cell_entity, Entity::PLACEHOLDER);
 
                         if entity != Entity::PLACEHOLDER {
-                            commands.entity(entity).despawn_recursive();
+                            commands.entity(entity).despawn();
                         }
                     }
 
@@ -518,16 +519,19 @@ fn update(
                                     Camera {
                                         clear_color: ClearColorConfig::Custom(Color::NONE),
                                         order: -1,
-                                        target: RenderTarget::Image(image_handle.clone()),
                                         ..default()
                                     },
+                                    RenderTarget::Image(ImageRenderTarget {
+                                        handle: image_handle.clone(),
+                                        scale_factor: 1.0,
+                                    }),
                                     RenderLayers::layer(1),
                                     Transform::from_xyz(0.0, 0.0, 0.0),
                                     #[cfg(target_os = "android")]
                                     Msaa::Off,
                                 ));
 
-                                builder.spawn(UiImage::new(image_handle));
+                                builder.spawn(ImageNode::new(image_handle));
                             })
                             .id();
                     });
@@ -550,7 +554,7 @@ fn update(
                         let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                         if entity != Entity::PLACEHOLDER {
-                            commands.entity(entity).despawn_recursive();
+                            commands.entity(entity).despawn();
                         }
                     }
                 }
@@ -565,7 +569,7 @@ fn update(
                         let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                         if entity != Entity::PLACEHOLDER {
-                            commands.entity(entity).despawn_recursive();
+                            commands.entity(entity).despawn();
                         }
                     }
                 }
@@ -580,7 +584,7 @@ fn update(
                         let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                         if entity != Entity::PLACEHOLDER {
-                            commands.entity(entity).despawn_recursive();
+                            commands.entity(entity).despawn();
                         }
                     }
                 }
@@ -596,7 +600,7 @@ fn update(
                             let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                             if entity != Entity::PLACEHOLDER {
-                                commands.entity(entity).despawn_recursive();
+                                commands.entity(entity).despawn();
                             }
                         }
                     }
@@ -613,7 +617,7 @@ fn update(
                             let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                             if entity != Entity::PLACEHOLDER {
-                                commands.entity(entity).despawn_recursive();
+                                commands.entity(entity).despawn();
                             }
                         }
                     }
@@ -628,7 +632,7 @@ fn update(
                             let entity = mem::replace(entity, Entity::PLACEHOLDER);
 
                             if entity != Entity::PLACEHOLDER {
-                                commands.entity(entity).despawn_recursive();
+                                commands.entity(entity).despawn();
                             }
                         }
                     }
@@ -664,7 +668,7 @@ fn update(
 fn new_cell(
     terminal_state: &mut TerminalState,
     terminal_fonts: &TerminalFonts,
-    builder: &mut ChildBuilder<'_>,
+    builder: &mut ChildSpawnerCommands<'_>,
     character: char,
 ) -> Entity {
     let [grid_column, grid_row] = (terminal_state.cursor_position() + UVec2::ONE)
