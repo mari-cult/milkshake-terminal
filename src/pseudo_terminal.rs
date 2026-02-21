@@ -27,6 +27,15 @@ impl PseudoTerminal {
         let control = Arc::new(File::from(pty.controller));
         let user = pty.user;
 
+        // Configure TTY for echo and newline conversion
+        use rustix::termios::*;
+        if let Ok(mut t) = tcgetattr(&user) {
+            t.local_modes |=
+                LocalModes::ECHO | LocalModes::ICANON | LocalModes::ECHOE | LocalModes::ECHOK;
+            t.input_modes |= InputModes::ICRNL;
+            let _ = tcsetattr(&user, OptionalActions::Now, &t);
+        }
+
         Ok(PseudoTerminal { control, user })
     }
 
@@ -36,6 +45,7 @@ impl PseudoTerminal {
         command
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
+            .env("LANG", "en_US.UTF-8")
             .stdin(user.try_clone()?)
             .stdout(user.try_clone()?)
             .stderr(user.try_clone()?);
@@ -45,6 +55,19 @@ impl PseudoTerminal {
 
             command.pre_exec(move || set_controlling_terminal(user));
         }
+
+        Ok(())
+    }
+
+    pub fn resize(&self, size: UVec2) -> io::Result<()> {
+        let size = Winsize {
+            ws_col: size.x as u16,
+            ws_row: size.y as u16,
+            ws_xpixel: (size.x * 10) as u16,
+            ws_ypixel: (size.y * 18) as u16,
+        };
+
+        rustix::termios::tcsetwinsize(&self.control, size)?;
 
         Ok(())
     }
