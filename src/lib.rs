@@ -1,64 +1,135 @@
 #![allow(dead_code)]
-use crate::vte::AnsiColor;
 
-use self::vte::{Vte, VteEvent};
-use bevy::asset::{RenderAssetUsages, embedded_asset};
-use bevy::color::Gray;
-use bevy::color::palettes::basic;
-use bevy::input::keyboard::KeyboardInput;
-use bevy::input::mouse::MouseWheel;
-use bevy::log::{debug, info};
-use bevy::prelude::*;
-use bevy::window::WindowResized;
+use crate::pseudo_terminal::{GridSize, PseudoTerminal};
+use crate::vte::{AnsiColor, Intensity, NamedColor, Position, StandardColor, Vte, VteEvent};
+use bytemuck::{Pod, Zeroable};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
-use pseudo_terminal::PseudoTerminal;
-use std::io::{Read, Write};
-use std::process::Command;
-use std::{io, mem, thread};
-use vte::{Intensity, StandardColor};
+use image::GenericImageView;
+use glyphon::{
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
+use std::collections::VecDeque;
+use wgpu::{
+    ColorTargetState, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
+    DeviceDescriptor, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
+    Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PresentMode, PrimitiveState,
+    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
+    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, SurfaceConfiguration,
+    TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 mod convert;
-mod font;
 mod pseudo_terminal;
 mod shell;
 mod vte;
 
-#[derive(Clone, Copy, Component, Debug, Default, Reflect)]
-#[reflect(Component, Debug, Default)]
-#[require(Node)]
-pub struct Terminal;
+const HISTORY_ROWS: u32 = 1000;
+const CELL_WIDTH: f32 = 10.0;
+const CELL_HEIGHT: f32 = 18.0;
+const FONT_SIZE: f32 = 14.0;
 
-#[derive(Clone, Copy, Component, Debug, Default, Reflect)]
-#[reflect(Component, Debug, Default)]
-#[require(Node, Text)]
-pub struct TerminalCell;
+const BG_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
 
-#[derive(Component, Debug)]
-#[require(Terminal)]
-pub struct TerminalCommand(pub Command);
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
 
-#[derive(Clone, Debug, Reflect, Component)]
-pub struct TerminalFonts {
-    pub regular: Handle<Font>,
-    pub regular_italic: Handle<Font>,
-    pub bold: Handle<Font>,
-    pub bold_italic: Handle<Font>,
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(in.pos, 0.0, 1.0);
+    out.color = in.color;
+    return out;
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TerminalStyle {
-    foreground: Color,
-    background: Color,
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+const IMAGE_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(in.pos, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@group(0) @binding(0) var image_tex: texture_2d<f32>;
+@group(0) @binding(1) var image_sampler: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(image_tex, image_sampler, in.uv);
+}
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CursorPos {
+    x: u32,
+    y: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Rgba {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl Rgba {
+    const WHITE: Self = Self::rgb(255, 255, 255);
+    const BLACK: Self = Self::rgb(0, 0, 0);
+
+    const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 255 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CellStyle {
+    fg: Rgba,
+    bg: Option<Rgba>,
     bold: bool,
     italic: bool,
 }
 
-impl Default for TerminalStyle {
+impl Default for CellStyle {
     fn default() -> Self {
         Self {
-            foreground: Color::WHITE,
-            background: Color::NONE,
+            fg: Rgba::WHITE,
+            bg: None,
             bold: false,
             italic: false,
         }
@@ -66,897 +137,1505 @@ impl Default for TerminalStyle {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TerminalState {
-    cursor_position: UVec2,
-    style: TerminalStyle,
-    size: UVec2,
+struct Cell {
+    ch: char,
+    style: CellStyle,
 }
 
-impl Default for TerminalState {
+#[derive(Clone, Debug)]
+struct AnimatedCursor {
+    position: CursorPos,
+    target: CursorPos,
+    last_tick: Instant,
+    trail: VecDeque<CursorTrailSample>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CursorTrailSample {
+    position: CursorPos,
+    born_at: Instant,
+}
+
+impl AnimatedCursor {
+    fn new(position: CursorPos) -> Self {
+        let now = Instant::now();
+        Self {
+            position,
+            target: position,
+            last_tick: now,
+            trail: VecDeque::new(),
+        }
+    }
+
+    fn set_target(&mut self, target: CursorPos) {
+        if self.target != target {
+            self.target = target;
+        }
+    }
+
+    fn update(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+
+        let mut changed = false;
+        let smoothing = 1.0 - (-dt.as_secs_f32() * 18.0).exp();
+
+        let next_x = lerp_u32(self.position.x, self.target.x, smoothing);
+        let next_y = lerp_u32(self.position.y, self.target.y, smoothing);
+        if next_x != self.position.x || next_y != self.position.y {
+            self.trail.push_front(CursorTrailSample {
+                position: self.position,
+                born_at: now,
+            });
+            while self.trail.len() > 10 {
+                self.trail.pop_back();
+            }
+            self.position = CursorPos {
+                x: next_x,
+                y: next_y,
+            };
+            changed = true;
+        }
+
+        while let Some(sample) = self.trail.back() {
+            if now.duration_since(sample.born_at).as_millis() > 160 {
+                self.trail.pop_back();
+                changed = true;
+            } else {
+                break;
+            }
+        }
+
+        changed || !self.trail.is_empty()
+    }
+}
+
+struct ImageSprite {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    pipeline: RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+}
+
+impl Default for Cell {
     fn default() -> Self {
         Self {
-            cursor_position: UVec2::ZERO,
-            style: Default::default(),
-            size: UVec2::new(80, 24),
+            ch: ' ',
+            style: CellStyle::default(),
         }
     }
 }
 
-impl TerminalState {
-    pub fn cursor_position(&self) -> UVec2 {
-        self.cursor_position
+#[derive(Debug)]
+struct TerminalModel {
+    cols: u32,
+    viewport_rows: u32,
+    row_start: usize,
+    cells: Vec<Cell>,
+    cursor: CursorPos,
+    style: CellStyle,
+    saved_cursor: Option<CursorPos>,
+    scroll_offset: i32,
+    image_logged: bool,
+}
+
+impl TerminalModel {
+    fn new(cols: u32, viewport_rows: u32) -> Self {
+        let cols = cols.max(1);
+        let viewport_rows = viewport_rows.max(1).min(HISTORY_ROWS);
+        Self {
+            cols,
+            viewport_rows,
+            row_start: 0,
+            cells: vec![Cell::default(); (cols * HISTORY_ROWS) as usize],
+            cursor: CursorPos { x: 0, y: 0 },
+            style: CellStyle::default(),
+            saved_cursor: None,
+            scroll_offset: 0,
+            image_logged: false,
+        }
     }
 
-    pub fn cursor_offset(&self) -> usize {
-        ((self.cursor_position.y * self.size.x) + self.cursor_position.x) as usize
+    fn resize(&mut self, cols: u32, viewport_rows: u32) {
+        let new_cols = cols.max(1);
+        let viewport_rows = viewport_rows.max(1).min(HISTORY_ROWS);
+        if new_cols != self.cols {
+            let old_cols = self.cols;
+            let old_row_start = self.row_start;
+            let old_cells = std::mem::take(&mut self.cells);
+            self.cells = vec![Cell::default(); (new_cols * HISTORY_ROWS) as usize];
+
+            for y in 0..HISTORY_ROWS {
+                for x in 0..old_cols.min(new_cols) {
+                    let old_physical_row = (old_row_start + y as usize) % HISTORY_ROWS as usize;
+                    let old_idx = old_physical_row * old_cols as usize + x as usize;
+                    let new_idx = self.index(y, x);
+                    self.cells[new_idx] = old_cells[old_idx];
+                }
+            }
+            self.cols = new_cols;
+            self.cursor.x = self.cursor.x.min(self.cols.saturating_sub(1));
+        }
+
+        self.viewport_rows = viewport_rows;
+        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top() as i32);
     }
 
-    pub fn move_up(&mut self, rows: u32) {
-        debug_assert!(rows >= 1);
-
-        self.cursor_position.y = self.cursor_position.y.saturating_sub(rows);
+    fn index(&self, y: u32, x: u32) -> usize {
+        let row = (self.row_start + y as usize) % HISTORY_ROWS as usize;
+        row * self.cols as usize + x as usize
     }
 
-    pub fn move_down(&mut self, rows: u32) {
-        debug_assert!(rows >= 1);
-
-        self.cursor_position.y = self.cursor_position.y.saturating_add(rows);
+    fn get(&self, y: u32, x: u32) -> Cell {
+        self.cells[self.index(y, x)]
     }
 
-    pub fn move_left(&mut self, columns: u32) {
-        debug_assert!(columns >= 1);
+    fn set(&mut self, y: u32, x: u32, cell: Cell) {
+        let idx = self.index(y, x);
+        self.cells[idx] = cell;
+    }
 
-        if self.cursor_position.x >= columns {
-            self.cursor_position.x -= columns;
+    fn clear_cell(&mut self, y: u32, x: u32) {
+        self.set(y, x, Cell::default());
+    }
+
+    fn clear_row(&mut self, y: u32) {
+        for x in 0..self.cols {
+            self.clear_cell(y, x);
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.cells.fill(Cell::default());
+    }
+
+    fn scroll_up_one(&mut self) {
+        self.row_start = (self.row_start + 1) % HISTORY_ROWS as usize;
+        self.clear_row(HISTORY_ROWS - 1);
+        self.cursor.y = HISTORY_ROWS - 1;
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        while self.cursor.y >= HISTORY_ROWS {
+            self.scroll_up_one();
+        }
+    }
+
+    fn screen_top(&self) -> u32 {
+        self.cursor
+            .y
+            .saturating_sub(self.viewport_rows.saturating_sub(1))
+    }
+
+    fn current_screen_top(&self) -> u32 {
+        self.screen_top()
+    }
+
+    fn current_view_top(&self) -> u32 {
+        let screen_top = self.screen_top() as i32;
+        (screen_top - self.scroll_offset).max(0) as u32
+    }
+
+    fn apply_vte_event(
+        &mut self,
+        event: VteEvent,
+        writer: &Sender<CompactString>,
+        on_image: &mut dyn FnMut(CompactString),
+    ) {
+        let current_screen_top = self.current_screen_top();
+        match event {
+            VteEvent::Echo(character) => {
+                if character == '\t' {
+                    let next_tab = (self.cursor.x / 8 + 1) * 8;
+                    self.move_right(next_tab.saturating_sub(self.cursor.x));
+                    self.ensure_cursor_visible();
+                    return;
+                }
+
+                self.ensure_cursor_visible();
+                self.set(
+                    self.cursor.y,
+                    self.cursor.x,
+                    Cell {
+                        ch: character,
+                        style: self.style,
+                    },
+                );
+                self.move_right(1);
+            }
+            VteEvent::Backspace => {
+                self.cursor.x = self.cursor.x.saturating_sub(1);
+                self.clear_cell(self.cursor.y, self.cursor.x);
+            }
+            VteEvent::Goto(Position { x, y }) => {
+                let x = x.saturating_sub(1).min(self.cols.saturating_sub(1));
+                let y = current_screen_top + y.saturating_sub(1);
+                self.cursor = CursorPos { x, y };
+                self.ensure_cursor_visible();
+            }
+            VteEvent::GotoX(x) => {
+                self.cursor.x = x.min(self.cols.saturating_sub(1));
+            }
+            VteEvent::GotoY(y) => {
+                self.cursor.y = current_screen_top + y.saturating_sub(1);
+                self.ensure_cursor_visible();
+            }
+            VteEvent::SaveCursorPosition => {
+                self.saved_cursor = Some(self.cursor);
+            }
+            VteEvent::RestoreCursorPosition => {
+                if let Some(cursor) = self.saved_cursor {
+                    self.cursor = cursor;
+                    self.ensure_cursor_visible();
+                }
+            }
+            VteEvent::LineUp(rows) => {
+                self.move_up(rows);
+                self.cursor.x = 0;
+            }
+            VteEvent::LineDown(rows) => {
+                self.move_down(rows);
+                self.cursor.x = 0;
+            }
+            VteEvent::MoveUp(rows) => self.move_up(rows),
+            VteEvent::MoveDown(rows) => self.move_down(rows),
+            VteEvent::MoveLeft(cols) => {
+                self.cursor.x = self.cursor.x.saturating_sub(cols);
+            }
+            VteEvent::MoveRight(cols) => self.move_right(cols),
+            VteEvent::ReportCursorPosition => {
+                let row_in_view = self.cursor.y as i32 - current_screen_top as i32 + 1;
+                let col_in_view = self.cursor.x + 1;
+                let response = format!("\x1b[{row_in_view};{col_in_view}R");
+                let _ = writer.send(response.into());
+            }
+            VteEvent::Reset => self.style = CellStyle::default(),
+            VteEvent::Bold => self.style.bold = true,
+            VteEvent::Italic => self.style.italic = true,
+            VteEvent::Foreground(color) => self.style.fg = ansi_to_rgb(color),
+            VteEvent::ResetForeground => self.style.fg = CellStyle::default().fg,
+            VteEvent::Background(color) => self.style.bg = Some(ansi_to_rgb(color)),
+            VteEvent::ResetBackground => self.style.bg = None,
+            VteEvent::ClearLeft => {
+                let y = self.cursor.y;
+                for x in 0..self.cursor.x {
+                    self.clear_cell(y, x);
+                }
+            }
+            VteEvent::ClearRight => {
+                let y = self.cursor.y;
+                for x in self.cursor.x..self.cols {
+                    self.clear_cell(y, x);
+                }
+            }
+            VteEvent::ClearLine => {
+                self.clear_row(self.cursor.y);
+            }
+            VteEvent::ClearUp => {
+                for y in 0..self.cursor.y {
+                    self.clear_row(y);
+                }
+                for x in 0..self.cursor.x {
+                    self.clear_cell(self.cursor.y, x);
+                }
+            }
+            VteEvent::ClearDown => {
+                for x in self.cursor.x..self.cols {
+                    self.clear_cell(self.cursor.y, x);
+                }
+                for y in (self.cursor.y + 1)..HISTORY_ROWS {
+                    self.clear_row(y);
+                }
+            }
+            VteEvent::ClearAll | VteEvent::ClearEverything => {
+                self.clear_all();
+                self.cursor = CursorPos {
+                    x: 0,
+                    y: current_screen_top,
+                };
+            }
+            VteEvent::Image(image) => {
+                on_image(image);
+            }
+            _ => {}
+        }
+
+        self.ensure_cursor_visible();
+        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top() as i32);
+    }
+
+    fn move_up(&mut self, rows: u32) {
+        self.cursor.y = self.cursor.y.saturating_sub(rows.max(1));
+    }
+
+    fn move_down(&mut self, rows: u32) {
+        self.cursor.y = self.cursor.y.saturating_add(rows.max(1));
+        self.ensure_cursor_visible();
+    }
+
+    fn move_right(&mut self, cols: u32) {
+        self.cursor.x = self.cursor.x.saturating_add(cols.max(1));
+        if self.cursor.x >= self.cols {
+            self.cursor.y = self.cursor.y.saturating_add(self.cursor.x / self.cols);
+            self.cursor.x %= self.cols;
+            self.ensure_cursor_visible();
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BgVertex {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
+
+struct BackgroundRenderer {
+    pipeline: RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
+    vertex_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ImageVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+}
+
+impl BackgroundRenderer {
+    fn new(device: &wgpu::Device, format: TextureFormat) -> Self {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("terminal-bg-shader"),
+            source: ShaderSource::Wgsl(BG_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("terminal-bg-layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("terminal-bg-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<BgVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            format: VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let vertex_capacity = 1024;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terminal-bg-vertices"),
+            size: (vertex_capacity * std::mem::size_of::<BgVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            vertex_buffer,
+            vertex_capacity,
+            vertex_count: 0,
+        }
+    }
+
+    fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[BgVertex]) {
+        self.vertex_count = vertices.len() as u32;
+        if vertices.is_empty() {
+            return;
+        }
+
+        if vertices.len() > self.vertex_capacity {
+            self.vertex_capacity = vertices.len().next_power_of_two();
+            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("terminal-bg-vertices"),
+                size: (self.vertex_capacity * std::mem::size_of::<BgVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(vertices));
+    }
+
+    fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.vertex_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
+impl ImageSprite {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: TextureFormat,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        x: f32,
+        y: f32,
+        surface_width: f32,
+        surface_height: f32,
+    ) -> io::Result<Self> {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terminal-image-texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            texture.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("terminal-image-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terminal-image-bind-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("terminal-image-pipeline-layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("terminal-image-shader"),
+            source: ShaderSource::Wgsl(IMAGE_SHADER.into()),
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("terminal-image-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageVertex>() as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            format: VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x2,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terminal-image-bind-group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terminal-image-vertex-buffer"),
+            size: (6 * std::mem::size_of::<ImageVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut sprite = Self {
+            texture,
+            bind_group,
+            pipeline,
+            vertex_buffer,
+            vertex_count: 6,
+            width,
+            height,
+            x,
+            y,
+        };
+        sprite.update_vertices(queue, surface_width, surface_height);
+        Ok(sprite)
+    }
+
+    fn update_vertices(&mut self, queue: &wgpu::Queue, surface_width: f32, surface_height: f32) {
+        let x0 = (self.x / surface_width) * 2.0 - 1.0;
+        let x1 = ((self.x + self.width as f32) / surface_width) * 2.0 - 1.0;
+        let y0 = 1.0 - (self.y / surface_height) * 2.0;
+        let y1 = 1.0 - ((self.y + self.height as f32) / surface_height) * 2.0;
+
+        let vertices = [
+            ImageVertex {
+                pos: [x0, y0],
+                uv: [0.0, 0.0],
+            },
+            ImageVertex {
+                pos: [x1, y0],
+                uv: [1.0, 0.0],
+            },
+            ImageVertex {
+                pos: [x1, y1],
+                uv: [1.0, 1.0],
+            },
+            ImageVertex {
+                pos: [x0, y0],
+                uv: [0.0, 0.0],
+            },
+            ImageVertex {
+                pos: [x1, y1],
+                uv: [1.0, 1.0],
+            },
+            ImageVertex {
+                pos: [x0, y1],
+                uv: [0.0, 1.0],
+            },
+        ];
+
+        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+    }
+
+    fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
+struct WindowState {
+    window: Arc<dyn Window>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    surface_config: SurfaceConfiguration,
+
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    viewport: Viewport,
+    atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    line_buffers: Vec<Buffer>,
+    bg_renderer: BackgroundRenderer,
+    cursor_renderer: BackgroundRenderer,
+    scale_factor: f64,
+    images: Vec<ImageSprite>,
+    cursor: AnimatedCursor,
+    content_dirty: bool,
+    cached_cursor_x_px: f32,
+
+    terminal: TerminalModel,
+    terminal_pty: PseudoTerminal,
+    reader: Receiver<VteEvent>,
+    writer: Sender<CompactString>,
+}
+
+impl WindowState {
+    async fn new(
+        window: Arc<dyn Window>,
+        proxy: EventLoopProxy,
+        redraw_pending: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        let size = window.surface_size();
+        let scale_factor = window.scale_factor();
+        let grid = grid_from_pixels(size.width, size.height, scale_factor);
+
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("request_adapter failed: {e}")))?;
+
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor::default())
+            .await
+            .map_err(|e| io::Error::other(format!("request_device failed: {e}")))?;
+
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| io::Error::other(format!("create_surface failed: {e}")))?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(TextureFormat::is_srgb)
+            .or_else(|| caps.formats.first().copied())
+            .ok_or_else(|| io::Error::other("no surface format available"))?;
+        let present_mode = if caps.present_modes.contains(&PresentMode::Fifo) {
+            PresentMode::Fifo
         } else {
-            let remaining = columns - self.cursor_position.x;
-            let rows_to_move = remaining.div_ceil(self.size.x);
-            if self.cursor_position.y >= rows_to_move {
-                self.cursor_position.y -= rows_to_move;
-                self.cursor_position.x =
-                    (self.cursor_position.x + rows_to_move * self.size.x) - columns;
-            } else {
-                self.cursor_position = UVec2::ZERO;
+            caps.present_modes[0]
+        };
+        let alpha_mode = if caps.alpha_modes.contains(&CompositeAlphaMode::Opaque) {
+            CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
+
+        let surface_config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
+
+        let mut font_system = FontSystem::new();
+        load_embedded_fonts(&mut font_system);
+        let swash_cache = SwashCache::new();
+        let cache = Cache::new(&device);
+        let viewport = Viewport::new(&device, &cache);
+        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let line_buffers = new_line_buffers(&mut font_system, grid.rows, grid.cols, scale_factor);
+        let bg_renderer = BackgroundRenderer::new(&device, format);
+        let cursor_renderer = BackgroundRenderer::new(&device, format);
+
+        let mut terminal_pty = PseudoTerminal::new(grid)?;
+        let mut command = shell::default();
+        terminal_pty.spawn(&mut command)?;
+
+        let (reader_tx, reader_rx) = crossbeam_channel::unbounded::<VteEvent>();
+        let mut pty_reader = terminal_pty.reader()?;
+        thread::spawn(move || {
+            let mut parser = Vte::new(Handler(reader_tx));
+            let mut bytes = [0u8; 4096];
+            loop {
+                match pty_reader.read(&mut bytes) {
+                    Ok(0) => {
+                        if !redraw_pending.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.wake_up();
+                        }
+                        break;
+                    }
+                    Ok(amount) => {
+                        parser.process(&bytes[..amount]);
+                        if !redraw_pending.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.wake_up();
+                        }
+                    }
+                    Err(_) => {
+                        if !redraw_pending.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.wake_up();
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<CompactString>();
+        let mut pty_writer = terminal_pty.writer()?;
+        thread::spawn(move || {
+            for payload in writer_rx {
+                let _ = pty_writer.write_all(payload.as_bytes());
+                let _ = pty_writer.flush();
+            }
+        });
+
+        Ok(Self {
+            window,
+            device,
+            queue,
+            surface,
+            surface_config,
+            font_system,
+            swash_cache,
+            viewport,
+            atlas,
+            text_renderer,
+            line_buffers,
+            bg_renderer,
+            cursor_renderer,
+            scale_factor,
+            images: Vec::new(),
+            cursor: AnimatedCursor::new(CursorPos { x: 0, y: 0 }),
+            content_dirty: true,
+            cached_cursor_x_px: 0.0,
+            terminal: TerminalModel::new(grid.cols, grid.rows),
+            terminal_pty,
+            reader: reader_rx,
+            writer: writer_tx,
+        })
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        self.surface_config.width = width;
+        self.surface_config.height = height;
+        self.surface.configure(&self.device, &self.surface_config);
+
+        self.scale_factor = self.window.scale_factor();
+        let grid = grid_from_pixels(width, height, self.scale_factor);
+        self.terminal.resize(grid.cols, grid.rows);
+        let _ = self.terminal_pty.resize(grid);
+        self.ensure_line_buffers(grid.rows, grid.cols);
+        self.content_dirty = true;
+    }
+
+    fn ensure_line_buffers(&mut self, rows: u32, cols: u32) {
+        let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
+        if self.line_buffers.len() != rows as usize {
+            self.line_buffers =
+                new_line_buffers(&mut self.font_system, rows, cols, self.scale_factor);
+        } else {
+            for buffer in &mut self.line_buffers {
+                buffer.set_size(
+                    &mut self.font_system,
+                    Some(cols as f32 * cell_width),
+                    Some(cell_height),
+                );
+                buffer.set_metrics(&mut self.font_system, Metrics::new(font_size, cell_height));
             }
         }
     }
 
-    pub fn move_right(&mut self, columns: u32) {
-        debug_assert!(columns >= 1);
+    fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
 
-        self.cursor_position.x += columns;
-        if self.cursor_position.x >= self.size.x {
-            self.cursor_position.y += self.cursor_position.x / self.size.x;
-            self.cursor_position.x %= self.size.x;
+        if let Some(payload) =
+            convert::convert_key(&event.logical_key.as_ref(), event.text.as_deref())
+        {
+            let _ = self.writer.send(payload);
         }
     }
 
-    pub fn goto(&mut self, position: UVec2) {
-        self.cursor_position.x = position.x.min(self.size.x - 1);
-        self.cursor_position.y = position.y; // Allow y to go beyond for scrolling detection
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        let previous = self.terminal.scroll_offset;
+        let lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y as i32,
+            MouseScrollDelta::PixelDelta(pos) => {
+                let (_, cell_height, _) = scaled_metrics(self.scale_factor);
+                (pos.y / cell_height as f64) as i32
+            }
+        };
+        self.terminal.scroll_offset =
+            (self.terminal.scroll_offset + lines).clamp(0, self.terminal.screen_top() as i32);
+        if self.terminal.scroll_offset != previous {
+            self.content_dirty = true;
+        }
     }
 
-    pub fn goto_x(&mut self, x: u32) {
-        self.cursor_position.x = x.min(self.size.x - 1);
+    fn pump_terminal(&mut self) -> bool {
+        let mut changed = false;
+        for event in self.reader.try_iter() {
+            changed = true;
+            let device = &self.device;
+            let queue = &self.queue;
+            let format = self.surface_config.format;
+            let surface_width = self.surface_config.width as f32;
+            let surface_height = self.surface_config.height as f32;
+            let scale_factor = self.scale_factor;
+            let terminal = &mut self.terminal;
+            let images = &mut self.images;
+            let cursor_x = terminal.cursor.x;
+            let cursor_y = terminal.cursor.y;
+            terminal.apply_vte_event(event, &self.writer, &mut |image| {
+                let Ok(image_data) =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, image)
+                else {
+                    return;
+                };
+                let Ok(decoded) = image::load_from_memory(&image_data) else {
+                    return;
+                };
+                let rgba = decoded.to_rgba8();
+                let (width, height) = decoded.dimensions();
+                let x = cursor_x as f32 * CELL_WIDTH * scale_factor as f32;
+                let y = cursor_y as f32 * CELL_HEIGHT * scale_factor as f32;
+                if let Ok(sprite) = ImageSprite::new(
+                    device,
+                    queue,
+                    format,
+                    &rgba,
+                    width,
+                    height,
+                    x,
+                    y,
+                    surface_width,
+                    surface_height,
+                ) {
+                    images.push(sprite);
+                }
+            });
+        }
+        self.cursor.set_target(self.terminal.cursor);
+        changed
     }
 
-    pub fn goto_y(&mut self, y: u32) {
-        self.cursor_position.y = y;
+    fn redraw(&mut self) {
+        if self.pump_terminal() {
+            self.content_dirty = true;
+        }
+
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.surface_config.width,
+                height: self.surface_config.height,
+            },
+        );
+
+        let view_top = self.terminal.current_view_top();
+        let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
+        self.ensure_line_buffers(self.terminal.viewport_rows, self.terminal.cols);
+        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+
+        if self.content_dirty {
+            let mut row_spans = Vec::with_capacity(view_rows as usize);
+            let mut row_texts = Vec::with_capacity(view_rows as usize);
+            let mut bg_vertices = Vec::new();
+
+            for row in 0..view_rows {
+                let y = view_top + row;
+                row_spans.push(self.row_spans(y));
+                let mut text = String::with_capacity(self.terminal.cols as usize);
+                for col in 0..self.terminal.cols {
+                    text.push(self.terminal.get(y, col).ch);
+                }
+                row_texts.push(text);
+
+                for col in 0..self.terminal.cols {
+                    let cell = self.terminal.get(y, col);
+                    if let Some(bg) = cell.style.bg {
+                        append_bg_quad(
+                            &mut bg_vertices,
+                            self.surface_config.width as f32,
+                            self.surface_config.height as f32,
+                            col as f32 * cell_width,
+                            row as f32 * cell_height,
+                            cell_width,
+                            cell_height,
+                            bg,
+                        );
+                    }
+                }
+            }
+
+            for (row, spans) in row_spans.iter().enumerate() {
+                let line_buffer = &mut self.line_buffers[row];
+                let default_attrs = Attrs::new()
+                    .family(Family::Monospace)
+                    .color(Color::rgba(255, 255, 255, 255));
+                line_buffer.set_rich_text(
+                    &mut self.font_system,
+                    spans
+                        .iter()
+                        .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+                    &default_attrs,
+                    Shaping::Basic,
+                    None,
+                );
+                line_buffer.shape_until_scroll(&mut self.font_system, false);
+            }
+
+            let cursor_row = self.terminal.cursor.y.saturating_sub(view_top) as usize;
+            self.cached_cursor_x_px =
+                if cursor_row < self.line_buffers.len() && cursor_row < row_texts.len() {
+                    cursor_x_from_shaped_line(
+                        &mut self.line_buffers[cursor_row],
+                        &mut self.font_system,
+                        &row_texts[cursor_row],
+                        self.terminal.cursor.x as usize,
+                        cell_width,
+                    )
+                } else {
+                    self.terminal.cursor.x as f32 * cell_width
+                };
+
+            let mut text_areas = Vec::with_capacity(view_rows as usize);
+            for (row, line_buffer) in self
+                .line_buffers
+                .iter()
+                .take(view_rows as usize)
+                .enumerate()
+            {
+                text_areas.push(TextArea {
+                    buffer: line_buffer,
+                    left: 0.0,
+                    top: row as f32 * cell_height,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: self.surface_config.width as i32,
+                        bottom: self.surface_config.height as i32,
+                    },
+                    default_color: Color::rgba(255, 255, 255, 255),
+                    custom_glyphs: &[],
+                });
+            }
+
+            self.bg_renderer
+                .prepare(&self.device, &self.queue, &bg_vertices);
+            let _ = self.text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                text_areas,
+                &mut self.swash_cache,
+            );
+            self.content_dirty = false;
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
+                frame
+            }
+            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            CurrentSurfaceTexture::Timeout
+            | CurrentSurfaceTexture::Occluded
+            | CurrentSurfaceTexture::Validation => return,
+        };
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("terminal-encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("terminal-pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.bg_renderer.render(&mut pass);
+            let _ = self
+                .text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass);
+            for image in &self.images {
+                image.render(&mut pass);
+            }
+
+            let (_, cell_height, _) = scaled_metrics(self.scale_factor);
+            let mut cursor_vertices = Vec::new();
+            let cursor_samples: Vec<(CursorPos, u8)> = std::iter::once((self.cursor.position, 220))
+                .chain(self.cursor.trail.iter().enumerate().map(|(idx, sample)| {
+                    let alpha = match idx {
+                        0 => 160,
+                        1 => 120,
+                        2 => 90,
+                        3 => 70,
+                        _ => 40,
+                    };
+                    (sample.position, alpha)
+                }))
+                .collect();
+
+            for (index, (position, alpha)) in cursor_samples.iter().enumerate() {
+                if position.y < view_top || position.y >= view_top + view_rows {
+                    continue;
+                }
+
+                let progress = if index == 0 { 0.0 } else { index as f32 / 10.0 };
+                let width = 10.0_f32;
+                let inset = (width * (0.10 + progress * 0.10)).min(width * 0.35);
+                let x = (self.cached_cursor_x_px - inset * 0.25).max(0.0);
+                let y = (position.y - view_top) as f32 * cell_height + inset * 0.15;
+                let w = width - inset * 0.5;
+                let h = cell_height - inset * 0.25;
+                append_bg_quad(
+                    &mut cursor_vertices,
+                    self.surface_config.width as f32,
+                    self.surface_config.height as f32,
+                    x,
+                    y,
+                    w,
+                    h,
+                    Rgba {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: *alpha,
+                    },
+                );
+            }
+
+            self.cursor_renderer
+                .prepare(&self.device, &self.queue, &cursor_vertices);
+            self.cursor_renderer.render(&mut pass);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        self.atlas.trim();
+        if self.cursor.update() {
+            self.window.request_redraw();
+        }
     }
 
-    pub fn line_up(&mut self, rows: u32) {
-        self.move_up(rows);
-        self.goto_x(0);
-    }
+    fn row_spans(&self, y: u32) -> Vec<(String, Attrs<'static>)> {
+        let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
+        let mut current_style: Option<CellStyle> = None;
 
-    pub fn line_down(&mut self, rows: u32) {
-        self.move_down(rows);
-        self.goto_x(0);
-    }
+        for x in 0..self.terminal.cols {
+            let cell = self.terminal.get(y, x);
+            if current_style == Some(cell.style) {
+                if let Some((text, _)) = spans.last_mut() {
+                    text.push(cell.ch);
+                }
+            } else {
+                current_style = Some(cell.style);
+                spans.push((cell.ch.to_string(), attrs_from_style(cell.style)));
+            }
+        }
 
-    pub fn style(&self) -> TerminalStyle {
-        self.style
-    }
-
-    pub fn set_bold(&mut self) {
-        self.style.bold = true;
-    }
-
-    pub fn set_italic(&mut self) {
-        self.style.italic = true;
-    }
-
-    pub fn reset(&mut self) {
-        mem::take(&mut self.style);
+        if spans.is_empty() {
+            spans.push((" ".to_string(), attrs_from_style(CellStyle::default())));
+        }
+        spans
     }
 }
 
-#[derive(Debug, Component)]
-pub struct InternalTerminalState {
-    cells: Vec<Entity>,
-    rows: Vec<Entity>,
-    pseudo_terminal: PseudoTerminal,
-    writer: Sender<CompactString>,
-    reader: Receiver<VteEvent>,
-    state: TerminalState,
-    scroll_offset: i32,
-    saved_cursor: Option<UVec2>,
-    viewport_height: u32,
+struct App {
+    state: Option<WindowState>,
+    proxy: EventLoopProxy,
+    redraw_pending: Arc<AtomicBool>,
 }
 
-pub struct TerminalPlugin;
+impl ApplicationHandler for App {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
 
-impl Plugin for TerminalPlugin {
-    fn build(&self, app: &mut App) {
-        embedded_asset!(app, "../assets/fonts/RobotoMono-SemiBold.ttf");
-        embedded_asset!(app, "../assets/fonts/RobotoMono-SemiBoldItalic.ttf");
-        embedded_asset!(app, "../assets/fonts/RobotoMono-Bold.ttf");
-        embedded_asset!(app, "../assets/fonts/RobotoMono-BoldItalic.ttf");
+        let attributes = WindowAttributes::default()
+            .with_title("milkshake-terminal")
+            .with_surface_size(LogicalSize::new(1200.0, 720.0));
+        let window = Arc::from(event_loop.create_window(attributes).expect("create window"));
+
+        match pollster::block_on(WindowState::new(
+            window,
+            self.proxy.clone(),
+            self.redraw_pending.clone(),
+        )) {
+            Ok(state) => self.state = Some(state),
+            Err(err) => {
+                eprintln!("failed to initialize terminal: {err}");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn proxy_wake_up(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        // Event-driven rendering: redraw is requested only by input/resize/proxy wake-up.
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::SurfaceResized(size) => {
+                state.resize(size.width, size.height);
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                state.handle_mouse_wheel(delta);
+                state.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                state.handle_keyboard(&event);
+                state.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                state.redraw();
+                self.redraw_pending.store(false, Ordering::Release);
+            }
+            _ => {}
+        }
     }
 }
 
-#[bevy_main]
 pub fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::BLACK))
-        .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    #[cfg(target_os = "android")]
-                    resizable: false,
-                    #[cfg(target_os = "android")]
-                    mode: WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
-                    recognize_rotation_gesture: true,
-                    ..default()
-                }),
-                ..default()
-            }),
-            TerminalPlugin,
-        ))
-        .add_systems(Startup, setup)
-        .add_systems(Update, (setup_terminal, update, rotate_cubes))
-        .run();
-}
-
-fn rotate_cubes(mut query: Query<&mut Transform, With<Cube>>, time: ResMut<Time>) {
-    for mut transform in query.iter_mut() {
-        transform.rotate_local_x(time.delta_secs());
-    }
-}
-
-fn setup(asset_server: Res<AssetServer>, mut commands: Commands) {
-    commands.spawn((
-        Camera3d::default(),
-        #[cfg(target_os = "android")]
-        Msaa::Off,
-    ));
-
-    commands.spawn((
-        Node {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            height: Val::Percent(100.0),
-            width: Val::Percent(100.0),
-            ..default()
-        },
-        Terminal,
-        TerminalCommand(shell::default()),
-        font::default(&asset_server),
-    ));
+    let event_loop = EventLoop::new().expect("create event loop");
+    let proxy = event_loop.create_proxy();
+    let app = App {
+        state: None,
+        proxy,
+        redraw_pending: Arc::new(AtomicBool::new(false)),
+    };
+    event_loop.run_app(app).expect("run app");
 }
 
 struct Handler(Sender<VteEvent>);
 
 impl vte::VteHandler for Handler {
     fn vte_event(&mut self, event: VteEvent) {
-        self.0.send(event).unwrap();
+        let _ = self.0.send(event);
     }
 }
 
-pub fn setup_terminal(
-    mut commands: Commands,
-    mut query: Query<(Entity, &mut TerminalCommand), Without<InternalTerminalState>>,
+fn grid_from_pixels(width: u32, height: u32, scale_factor: f64) -> GridSize {
+    let (cell_width, cell_height, _) = scaled_metrics(scale_factor);
+    GridSize {
+        cols: ((width as f32 / cell_width).floor() as u32).max(1),
+        rows: ((height as f32 / cell_height).floor() as u32).max(1),
+    }
+}
+
+fn new_line_buffers(
+    font_system: &mut FontSystem,
+    rows: u32,
+    cols: u32,
+    scale_factor: f64,
+) -> Vec<Buffer> {
+    let (cell_width, cell_height, font_size) = scaled_metrics(scale_factor);
+    (0..rows)
+        .map(|_| {
+            let mut buffer = Buffer::new(font_system, Metrics::new(font_size, cell_height));
+            buffer.set_size(
+                font_system,
+                Some(cols as f32 * cell_width),
+                Some(cell_height),
+            );
+            buffer
+        })
+        .collect()
+}
+
+fn scaled_metrics(scale_factor: f64) -> (f32, f32, f32) {
+    let scale = scale_factor.max(1.0) as f32;
+    (CELL_WIDTH * scale, CELL_HEIGHT * scale, FONT_SIZE * scale)
+}
+
+fn lerp_u32(current: u32, target: u32, t: f32) -> u32 {
+    let current = current as f32;
+    let target = target as f32;
+    (current + (target - current) * t).round().max(0.0) as u32
+}
+
+fn cursor_x_from_shaped_line(
+    buffer: &mut Buffer,
+    font_system: &mut FontSystem,
+    row_text: &str,
+    cursor_col: usize,
+    fallback_cell_width: f32,
+) -> f32 {
+    let byte_idx = row_text
+        .char_indices()
+        .nth(cursor_col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(row_text.len());
+
+    let Some(layout) = buffer.line_layout(font_system, 0) else {
+        return cursor_col as f32 * fallback_cell_width;
+    };
+    let Some(line) = layout.last() else {
+        return cursor_col as f32 * fallback_cell_width;
+    };
+
+    if byte_idx == 0 {
+        return 0.0;
+    }
+
+    let mut x = 0.0;
+    for glyph in &line.glyphs {
+        if glyph.end <= byte_idx {
+            x = glyph.x + glyph.w;
+        } else {
+            break;
+        }
+    }
+    if x == 0.0 {
+        cursor_col as f32 * fallback_cell_width
+    } else {
+        x
+    }
+}
+
+fn attrs_from_style(style: CellStyle) -> Attrs<'static> {
+    let weight = if style.bold {
+        Weight::BOLD
+    } else {
+        Weight::NORMAL
+    };
+    let slant = if style.italic {
+        Style::Italic
+    } else {
+        Style::Normal
+    };
+
+    Attrs::new()
+        .family(Family::Monospace)
+        .color(Color::rgba(style.fg.r, style.fg.g, style.fg.b, style.fg.a))
+        .weight(weight)
+        .style(slant)
+}
+
+fn append_bg_quad(
+    out: &mut Vec<BgVertex>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
 ) {
-    for (entity, mut command) in query.iter_mut() {
-        let mut pseudo_terminal = PseudoTerminal::new(UVec2::new(80, 24)).unwrap();
+    let color = [
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        color.a as f32 / 255.0,
+    ];
 
-        pseudo_terminal.configure_command(&mut command.0).unwrap();
+    let x0 = (x / width) * 2.0 - 1.0;
+    let x1 = ((x + w) / width) * 2.0 - 1.0;
+    let y0 = 1.0 - (y / height) * 2.0;
+    let y1 = 1.0 - ((y + h) / height) * 2.0;
 
-        let reader = {
-            let (sender, receiver) = crossbeam_channel::unbounded::<VteEvent>();
-            let mut control = pseudo_terminal.control.clone();
-
-            thread::spawn(move || {
-                let mut vte = Vte::new(Handler(sender));
-                let mut buf = [0; 1024];
-
-                while let Ok(amount) = control.read(&mut buf) {
-                    if amount == 0 {
-                        info!("Reader thread: EOF reached");
-                        break;
-                    }
-                    info!(
-                        "Reader thread: read {} bytes: {:?}",
-                        amount,
-                        String::from_utf8_lossy(&buf[..amount])
-                    );
-                    vte.process(&buf[..amount]);
-                }
-            });
-
-            receiver
-        };
-
-        let writer = {
-            let (sender, receiver) = crossbeam_channel::unbounded::<CompactString>();
-            let mut control = pseudo_terminal.control.clone();
-
-            thread::spawn(move || {
-                for text in receiver.iter() {
-                    info!("Writing to PTY: {:?}", text);
-                    control.write_all(text.as_bytes())?;
-                }
-
-                io::Result::Ok(())
-            });
-
-            sender
-        };
-
-        let result = command.0.spawn();
-
-        debug!("spawn command: {command:?} {result:?}");
-
-        let mut rows = Vec::with_capacity(1000);
-        commands.entity(entity).with_children(|builder| {
-            for _ in 0..1000 {
-                rows.push(
-                    builder
-                        .spawn(Node {
-                            display: Display::None,
-                            grid_template_columns: RepeatedGridTrack::px(80, 10.0),
-                            grid_template_rows: RepeatedGridTrack::px(1, 18.0),
-                            width: Val::Percent(100.0),
-                            height: Val::Px(18.0),
-                            ..default()
-                        })
-                        .id(),
-                );
-            }
-        });
-
-        let internal_terminal_state = InternalTerminalState {
-            cells: vec![Entity::PLACEHOLDER; 80 * 1000],
-            rows,
-            pseudo_terminal,
-            reader,
-            writer,
-            state: TerminalState {
-                size: UVec2::new(80, 1000), // Logical size is 1000 rows
-                ..default()
-            },
-            scroll_offset: 0,
-            saved_cursor: None,
-            viewport_height: 24,
-        };
-
-        commands.entity(entity).insert(internal_terminal_state);
-    }
+    out.extend_from_slice(&[
+        BgVertex {
+            pos: [x0, y0],
+            color,
+        },
+        BgVertex {
+            pos: [x1, y0],
+            color,
+        },
+        BgVertex {
+            pos: [x1, y1],
+            color,
+        },
+        BgVertex {
+            pos: [x0, y0],
+            color,
+        },
+        BgVertex {
+            pos: [x1, y1],
+            color,
+        },
+        BgVertex {
+            pos: [x0, y1],
+            color,
+        },
+    ]);
 }
 
-#[derive(Clone, Copy, Component, Debug, Default, Eq, PartialEq, Reflect)]
-pub struct Cube;
-
-static TABLE: [Srgba; 16] = [
-    // Normal
-    basic::BLACK,
-    basic::RED,
-    basic::GREEN,
-    basic::YELLOW,
-    basic::BLUE,
-    basic::FUCHSIA,
-    basic::AQUA,
-    basic::WHITE,
-    // Bright
-    Srgba::rgb(0.3, 0.3, 0.3),
-    Srgba::rgb(1.0, 0.3, 0.3),
-    Srgba::rgb(0.3, 1.0, 0.3),
-    Srgba::rgb(1.0, 1.0, 0.3),
-    Srgba::rgb(0.3, 0.3, 1.0),
-    Srgba::rgb(1.0, 0.3, 1.0),
-    Srgba::rgb(0.3, 1.0, 1.0),
-    Srgba::WHITE,
+static ANSI_TABLE: [Rgba; 16] = [
+    Rgba::rgb(0, 0, 0),
+    Rgba::rgb(255, 0, 0),
+    Rgba::rgb(0, 255, 0),
+    Rgba::rgb(255, 255, 0),
+    Rgba::rgb(0, 0, 255),
+    Rgba::rgb(255, 0, 255),
+    Rgba::rgb(0, 255, 255),
+    Rgba::rgb(255, 255, 255),
+    Rgba::rgb(77, 77, 77),
+    Rgba::rgb(255, 77, 77),
+    Rgba::rgb(77, 255, 77),
+    Rgba::rgb(255, 255, 77),
+    Rgba::rgb(77, 77, 255),
+    Rgba::rgb(255, 77, 255),
+    Rgba::rgb(77, 255, 255),
+    Rgba::rgb(255, 255, 255),
 ];
 
-fn index_to_color(index: u8) -> Srgba {
+fn ansi_to_rgb(color: AnsiColor) -> Rgba {
+    match color {
+        AnsiColor::Standard(StandardColor { color, intensity }) => {
+            let base = match color {
+                NamedColor::Black => 0,
+                NamedColor::Red => 1,
+                NamedColor::Green => 2,
+                NamedColor::Yellow => 3,
+                NamedColor::Blue => 4,
+                NamedColor::Magenta => 5,
+                NamedColor::Cyan => 6,
+                NamedColor::White => 7,
+            };
+            let idx = base + if intensity == Intensity::Bright { 8 } else { 0 };
+            ANSI_TABLE[idx]
+        }
+        AnsiColor::Index(index) => index_to_color(index),
+        AnsiColor::Rgb(r, g, b) => Rgba::rgb(r, g, b),
+    }
+}
+
+fn index_to_color(index: u8) -> Rgba {
     match index {
-        0..=15 => TABLE[index as usize],
+        0..=15 => ANSI_TABLE[index as usize],
         16..=231 => {
-            let index = index - 16;
-            let r = (index / 36) % 6;
-            let g = (index / 6) % 6;
-            let b = index % 6;
+            let idx = index - 16;
+            let r = (idx / 36) % 6;
+            let g = (idx / 6) % 6;
+            let b = idx % 6;
             let r = if r == 0 { 0 } else { r * 40 + 55 };
             let g = if g == 0 { 0 } else { g * 40 + 55 };
             let b = if b == 0 { 0 } else { b * 40 + 55 };
-            Srgba::rgb_u8(r, g, b)
+            Rgba::rgb(r, g, b)
         }
         232..=255 => {
-            let val = (index - 232) * 10 + 8;
-            Srgba::rgb_u8(val, val, val)
+            let value = (index - 232) * 10 + 8;
+            Rgba::rgb(value, value, value)
         }
     }
 }
 
-fn update(
-    mut commands: Commands,
-    mut images: ResMut<Assets<Image>>,
-    _meshes: ResMut<Assets<Mesh>>,
-    _materials: ResMut<Assets<StandardMaterial>>,
-    mut keyboard_input: MessageReader<KeyboardInput>,
-    mut mouse_wheel_input: MessageReader<MouseWheel>,
-    mut resize_events: MessageReader<WindowResized>,
-    mut query: Query<(Entity, &mut InternalTerminalState)>,
-    terminal_fonts: Query<&TerminalFonts>,
-    touch_input: Res<Touches>,
-    mut cell_query: Query<(
-        &mut BackgroundColor,
-        &mut Text,
-        &mut TextColor,
-        &mut TextFont,
-        Option<&mut TextLayout>,
-    )>,
-    mut node_query: Query<&mut Node>,
-) {
-    let mut last_resize = None;
-    for event in resize_events.read() {
-        last_resize = Some(event);
-    }
-
-    if let Some(event) = last_resize {
-        let cols = (event.width / 10.0) as u32;
-        let rows_count = (event.height / 18.0) as u32;
-        info!(
-            "Window resized to {}x{}, terminal grid {}x{}",
-            event.width, event.height, cols, rows_count
-        );
-
-        for (_, mut internal_state) in query.iter_mut() {
-            let old_cols = internal_state.state.size.x;
-            if old_cols != cols {
-                // Reflow cells
-                let mut new_cells = vec![Entity::PLACEHOLDER; (cols * 1000) as usize];
-                for y in 0..1000 {
-                    for x in 0..old_cols.min(cols) {
-                        new_cells[(y * cols + x) as usize] =
-                            internal_state.cells[(y * old_cols + x) as usize];
-                    }
-                }
-                internal_state.cells = new_cells;
-            }
-
-            internal_state.state.size.x = cols;
-            internal_state.viewport_height = rows_count;
-            // We keep logical 1000 rows for now, but PTY needs to know visible rows
-            let _ = internal_state
-                .pseudo_terminal
-                .resize(UVec2::new(cols, rows_count));
-
-            // Update all row nodes to have the new grid template columns
-            let target_grid: Vec<RepeatedGridTrack> =
-                vec![RepeatedGridTrack::px(cols as u16, 10.0)];
-            for row_entity in &internal_state.rows {
-                if let Ok(node) = node_query.get(*row_entity) {
-                    if node.grid_template_columns != target_grid {
-                        if let Ok(mut node_mut) = node_query.get_mut(*row_entity) {
-                            node_mut.grid_template_columns = target_grid.clone();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for (terminal_entity, mut internal_state) in query.iter_mut() {
-        let InternalTerminalState {
-            cells,
-            rows,
-            reader,
-            writer,
-            state,
-            scroll_offset,
-            saved_cursor,
-            viewport_height,
-            ..
-        } = &mut *internal_state;
-
-        let viewport_height = *viewport_height;
-
-        let mut check_scroll = |state: &mut TerminalState,
-                                cells: &mut Vec<Entity>,
-                                rows: &mut Vec<Entity>,
-                                commands: &mut Commands| {
-            while state.cursor_position.y >= 1000 {
-                cells.rotate_left(state.size.x as usize);
-                let last_row_start = ((state.size.y - 1) * state.size.x) as usize;
-                (last_row_start..cells.len()).for_each(|i| {
-                    cells[i] = Entity::PLACEHOLDER;
-                });
-                let row = rows.remove(0);
-                commands.entity(row).despawn_children();
-                commands.entity(terminal_entity).add_child(row);
-                rows.push(row);
-                state.cursor_position.y -= 1;
-            }
-        };
-
-        for event in reader.try_iter() {
-            let current_screen_top =
-                (state.cursor_position.y as i32 - (viewport_height as i32 - 1)).max(0) as u32;
-
-            info!("VTE Event: {:?}", event);
-            match event {
-                VteEvent::Echo(character) => {
-                    info!(
-                        "Echoing: {:?} (U+{:04X}) at {:?}",
-                        character, character as u32, state.cursor_position
-                    );
-                    if character == '\t' {
-                        let next_tab = (state.cursor_position.x / 8 + 1) * 8;
-                        state.move_right(next_tab - state.cursor_position.x);
-                        check_scroll(state, cells, rows, &mut commands);
-                        continue;
-                    }
-
-                    check_scroll(state, cells, rows, &mut commands);
-
-                    let Some(cell_entity) = cells.get_mut(state.cursor_offset()) else {
-                        continue;
-                    };
-
-                    if *cell_entity == Entity::PLACEHOLDER {
-                        let row_entity = rows[state.cursor_position.y as usize];
-                        commands.entity(row_entity).with_children(|builder| {
-                            let terminal_fonts = terminal_fonts.get(terminal_entity).unwrap();
-                            *cell_entity = new_cell(state, terminal_fonts, builder, character);
-                        });
-                    } else {
-                        let terminal_fonts = terminal_fonts.get(terminal_entity).unwrap();
-                        set_cell(
-                            state,
-                            terminal_fonts,
-                            character,
-                            *cell_entity,
-                            &mut cell_query,
-                            &mut commands,
-                        );
-                    }
-
-                    state.move_right(1);
-                }
-                VteEvent::Backspace => {
-                    let old_y = state.cursor_position.y;
-                    state.cursor_position.x = state.cursor_position.x.saturating_sub(1);
-                    let row_entity = rows[old_y as usize];
-                    let Some(entity) = cells.get_mut(state.cursor_offset()) else {
-                        continue;
-                    };
-                    let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                    if entity != Entity::PLACEHOLDER {
-                        commands.entity(row_entity).detach_children(&[entity]);
-                        commands.entity(entity).despawn();
-                    }
-                }
-
-                VteEvent::Goto(new_position) => {
-                    // Position is 1-based and relative to screen top
-                    let x = (new_position.x).saturating_sub(1).min(state.size.x - 1);
-                    let y = current_screen_top + (new_position.y).saturating_sub(1);
-                    state.goto(UVec2::new(x, y));
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-                VteEvent::GotoX(x) => {
-                    state.cursor_position.x = x.min(state.size.x - 1);
-                }
-                VteEvent::GotoY(y) => {
-                    state.cursor_position.y = current_screen_top + y.saturating_sub(1);
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-
-                VteEvent::SaveCursorPosition => {
-                    info!("Saving cursor position: {:?}", state.cursor_position);
-                    *saved_cursor = Some(state.cursor_position);
-                }
-                VteEvent::RestoreCursorPosition => {
-                    if let Some(pos) = *saved_cursor {
-                        info!("Restoring cursor position to: {:?}", pos);
-                        state.cursor_position = pos;
-                        check_scroll(state, cells, rows, &mut commands);
-                    }
-                }
-
-                VteEvent::LineUp(rows_to_move) => state.line_up(rows_to_move),
-                VteEvent::LineDown(rows_to_move) => {
-                    state.move_down(rows_to_move);
-                    state.goto_x(0);
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-
-                VteEvent::MoveUp(rows_to_move) => state.move_up(rows_to_move),
-                VteEvent::MoveDown(rows_to_move) => {
-                    state.move_down(rows_to_move);
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-                VteEvent::MoveLeft(columns) => {
-                    state.cursor_position.x = state.cursor_position.x.saturating_sub(columns);
-                }
-                VteEvent::MoveRight(columns) => {
-                    state.move_right(columns);
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-
-                VteEvent::Image(image) => {
-                    let Ok(image_data) =
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, image)
-                    else {
-                        continue;
-                    };
-
-                    let mut reader = image::ImageReader::new(std::io::Cursor::new(image_data));
-                    let Ok(reader) = reader.with_guessed_format() else {
-                        continue;
-                    };
-                    let Ok(image) = reader.decode() else {
-                        continue;
-                    };
-
-                    let image_handle = images.add(Image::from_dynamic(
-                        image,
-                        true,
-                        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-                    ));
-
-                    let (x, y) = (state.cursor_position.x, state.cursor_position.y);
-
-                    // Clear a 10x10 area for the image
-                    for j in y..(y + 10).min(state.size.y) {
-                        let row_ent = rows[j as usize];
-                        for i in x..(x + 10).min(state.size.x) {
-                            if let Some(entity) = cells.get_mut((j * state.size.x + i) as usize) {
-                                let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                                if entity != Entity::PLACEHOLDER {
-                                    commands.entity(row_ent).detach_children(&[entity]);
-                                    commands.entity(entity).despawn();
-                                }
-                            }
-                        }
-                    }
-
-                    let row_entity = rows[state.cursor_position.y as usize];
-
-                    commands.entity(row_entity).with_children(|builder| {
-                        let grid_column =
-                            GridPlacement::start((state.cursor_position.x + 1) as i16);
-
-                        let cell_entity = builder
-                            .spawn((
-                                Node {
-                                    grid_column,
-                                    width: Val::Px(100.0),
-                                    height: Val::Px(100.0),
-                                    ..default()
-                                },
-                                TerminalCell,
-                            ))
-                            .with_children(|builder| {
-                                builder.spawn(ImageNode::new(image_handle));
-                            })
-                            .id();
-
-                        if let Some(c) = cells.get_mut(state.cursor_offset()) {
-                            *c = cell_entity;
-                        }
-                    });
-
-                    state.move_right(10);
-                    check_scroll(state, cells, rows, &mut commands);
-                }
-                VteEvent::ReportCursorPosition => {
-                    let row_in_view =
-                        state.cursor_position.y as i32 - current_screen_top as i32 + 1;
-                    let col_in_view = state.cursor_position.x + 1;
-                    let response = format!("\x1b[{row_in_view};{col_in_view}R");
-                    info!("Reporting cursor position: {:?}", response);
-                    writer.send(response.into()).unwrap();
-                }
-
-                VteEvent::Reset => {
-                    info!("VTE Reset state");
-                    state.reset();
-                }
-
-                VteEvent::Bold => state.set_bold(),
-                VteEvent::Italic => state.set_italic(),
-                VteEvent::Foreground(color) => {
-                    let color = match color {
-                        AnsiColor::Standard(StandardColor { color, intensity }) => {
-                            let idx =
-                                color as usize + if intensity == Intensity::Bright { 8 } else { 0 };
-                            TABLE[idx]
-                        }
-                        AnsiColor::Index(index) => index_to_color(index),
-                        AnsiColor::Rgb(r, g, b) => Srgba::rgb_u8(r, g, b),
-                    };
-                    state.style.foreground = color.into();
-                }
-                VteEvent::ResetForeground => {
-                    state.style.foreground = TerminalStyle::default().foreground;
-                }
-                VteEvent::Background(color) => {
-                    let color = match color {
-                        AnsiColor::Standard(StandardColor { color, intensity }) => {
-                            let idx =
-                                color as usize + if intensity == Intensity::Bright { 8 } else { 0 };
-                            TABLE[idx]
-                        }
-                        AnsiColor::Index(index) => index_to_color(index),
-                        AnsiColor::Rgb(r, g, b) => Srgba::rgb_u8(r, g, b),
-                    };
-                    state.style.background = color.into();
-                }
-                VteEvent::ResetBackground => {
-                    state.style.background = TerminalStyle::default().background;
-                }
-
-                VteEvent::ClearLeft => {
-                    let (x, y) = (state.cursor_position.x, state.cursor_position.y);
-                    let row_entity = rows[y as usize];
-                    for i in 0..x {
-                        if let Some(entity) = cells.get_mut((y * state.size.x + i) as usize) {
-                            let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                            if entity != Entity::PLACEHOLDER {
-                                commands.entity(row_entity).detach_children(&[entity]);
-                                commands.entity(entity).despawn();
-                            }
-                        }
-                    }
-                }
-                VteEvent::ClearRight => {
-                    let (x, y) = (state.cursor_position.x, state.cursor_position.y);
-                    let row_entity = rows[y as usize];
-                    for i in x..state.size.x {
-                        if let Some(entity) = cells.get_mut((y * state.size.x + i) as usize) {
-                            let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                            if entity != Entity::PLACEHOLDER {
-                                commands.entity(row_entity).detach_children(&[entity]);
-                                commands.entity(entity).despawn();
-                            }
-                        }
-                    }
-                }
-                VteEvent::ClearLine => {
-                    let y = state.cursor_position.y;
-                    let row_entity = rows[y as usize];
-                    for i in 0..state.size.x {
-                        if let Some(entity) = cells.get_mut((y * state.size.x + i) as usize) {
-                            let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                            if entity != Entity::PLACEHOLDER {
-                                commands.entity(row_entity).detach_children(&[entity]);
-                                commands.entity(entity).despawn();
-                            }
-                        }
-                    }
-                }
-                VteEvent::ClearUp => {
-                    let (x, y) = (state.cursor_position.x, state.cursor_position.y);
-                    // Clear all rows above
-                    for row_idx in 0..y {
-                        let row_ent = rows[row_idx as usize];
-                        for i in 0..state.size.x {
-                            if let Some(entity) =
-                                cells.get_mut((row_idx * state.size.x + i) as usize)
-                            {
-                                let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                                if entity != Entity::PLACEHOLDER {
-                                    commands.entity(row_ent).detach_children(&[entity]);
-                                    commands.entity(entity).despawn();
-                                }
-                            }
-                        }
-                    }
-                    // Clear left on current line
-                    let row_ent = rows[y as usize];
-                    for i in 0..x {
-                        if let Some(entity) = cells.get_mut((y * state.size.x + i) as usize) {
-                            let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                            if entity != Entity::PLACEHOLDER {
-                                commands.entity(row_ent).detach_children(&[entity]);
-                                commands.entity(entity).despawn();
-                            }
-                        }
-                    }
-                }
-                VteEvent::ClearDown => {
-                    let (x, y) = (state.cursor_position.x, state.cursor_position.y);
-                    // Clear right on current line
-                    let row_ent = rows[y as usize];
-                    for i in x..state.size.x {
-                        if let Some(entity) = cells.get_mut((y * state.size.x + i) as usize) {
-                            let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                            if entity != Entity::PLACEHOLDER {
-                                commands.entity(row_ent).detach_children(&[entity]);
-                                commands.entity(entity).despawn();
-                            }
-                        }
-                    }
-                    // Clear all rows below
-                    for row_idx in (y + 1)..state.size.y {
-                        let row_ent = rows[row_idx as usize];
-                        for i in 0..state.size.x {
-                            if let Some(entity) =
-                                cells.get_mut((row_idx * state.size.x + i) as usize)
-                            {
-                                let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                                if entity != Entity::PLACEHOLDER {
-                                    commands.entity(row_ent).detach_children(&[entity]);
-                                    commands.entity(entity).despawn();
-                                }
-                            }
-                        }
-                    }
-                }
-                VteEvent::ClearAll | VteEvent::ClearEverything => {
-                    for row_idx in 0..state.size.y {
-                        let row_ent = rows[row_idx as usize];
-                        for i in 0..state.size.x {
-                            if let Some(entity) =
-                                cells.get_mut((row_idx * state.size.x + i) as usize)
-                            {
-                                let entity = mem::replace(entity, Entity::PLACEHOLDER);
-                                if entity != Entity::PLACEHOLDER {
-                                    commands.entity(row_ent).detach_children(&[entity]);
-                                    commands.entity(entity).despawn();
-                                }
-                            }
-                        }
-                    }
-                    state.goto(UVec2::new(0, current_screen_top));
-                }
-                _ => {}
-            }
-        }
-
-        let screen_top =
-            (state.cursor_position.y as i32 - (viewport_height as i32 - 1)).max(0) as u32;
-
-        // Handle mouse wheel scrolling
-        for event in mouse_wheel_input.read() {
-            let dy = event.y;
-            *scroll_offset = (*scroll_offset + dy as i32).clamp(0, screen_top as i32);
-        }
-
-        // Update row visibility based on viewport and scroll offset
-        let view_top = (screen_top as i32 - *scroll_offset).max(0);
-        let view_bottom = view_top + (viewport_height as i32 - 1);
-
-        for (i, row_entity) in rows.iter().enumerate() {
-            let target_display = if i as i32 >= view_top && i as i32 <= view_bottom {
-                Display::Grid
-            } else {
-                Display::None
-            };
-
-            if let Ok(node) = node_query.get(*row_entity) {
-                if node.display != target_display {
-                    if let Ok(mut node_mut) = node_query.get_mut(*row_entity) {
-                        node_mut.display = target_display;
-                    }
-                }
-            }
-        }
-
-        if touch_input.any_just_pressed() {
-            debug!("process touch event: {touch_input:?}");
-
-            #[cfg(target_os = "android")]
-            bevy::window::ANDROID_APP
-                .get()
-                .unwrap()
-                .show_soft_input(true);
-        }
-
-        for event in keyboard_input.read() {
-            info!("Keyboard Event: {:?}", event);
-
-            if !event.state.is_pressed() {
-                continue;
-            }
-
-            if let Some(string) = convert::convert_key(&event.logical_key) {
-                info!("Sending to writer: {:?}", string);
-                writer.send(string).unwrap();
-            }
-        }
-    }
-}
-
-fn new_cell(
-    terminal_state: &mut TerminalState,
-    terminal_fonts: &TerminalFonts,
-    builder: &mut ChildSpawnerCommands<'_>,
-    character: char,
-) -> Entity {
-    let grid_column = GridPlacement::start((terminal_state.cursor_position.x + 1) as i16);
-
-    let font = match (terminal_state.style.bold, terminal_state.style.italic) {
-        (true, true) => &terminal_fonts.bold_italic,
-        (true, false) => &terminal_fonts.bold,
-        (false, true) => &terminal_fonts.regular_italic,
-        (false, false) => &terminal_fonts.regular,
-    };
-
-    builder
-        .spawn((
-            BackgroundColor(terminal_state.style.background),
-            Node {
-                grid_column,
-                ..default()
-            },
-            TerminalCell,
-            Text::new(character),
-            TextLayout::default(),
-            TextColor(if terminal_state.style.foreground == Color::NONE {
-                Color::WHITE
-            } else {
-                terminal_state.style.foreground
-            }),
-            TextFont {
-                font: font.clone(),
-                font_size: 14.0,
-                ..default()
-            },
-        ))
-        .id()
-}
-
-fn set_cell(
-    terminal_state: &mut TerminalState,
-    terminal_fonts: &TerminalFonts,
-    character: char,
-    cell_entity: Entity,
-    cell_query: &mut Query<(
-        &mut BackgroundColor,
-        &mut Text,
-        &mut TextColor,
-        &mut TextFont,
-        Option<&mut TextLayout>,
-    )>,
-    commands: &mut Commands,
-) {
-    let result = cell_query.get_mut(cell_entity);
-
-    if let Ok((mut background_color, mut text, mut text_color, mut text_font, layout)) = result {
-        let font = match (terminal_state.style.bold, terminal_state.style.italic) {
-            (true, true) => &terminal_fonts.bold_italic,
-            (true, false) => &terminal_fonts.bold,
-            (false, true) => &terminal_fonts.regular_italic,
-            (false, false) => &terminal_fonts.regular,
-        };
-
-        background_color.0 = terminal_state.style.background;
-        text.0 = character.to_string();
-        text_color.0 = if terminal_state.style.foreground == Color::NONE {
-            Color::WHITE
-        } else {
-            terminal_state.style.foreground
-        };
-        *text_font = TextFont {
-            font: font.clone(),
-            font_size: 14.0,
-            ..default()
-        };
-        if layout.is_none() {
-            commands.entity(cell_entity).insert(TextLayout::default());
-        }
-    }
+fn load_embedded_fonts(font_system: &mut FontSystem) {
+    let db = font_system.db_mut();
+    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-SemiBold.ttf").to_vec());
+    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-SemiBoldItalic.ttf").to_vec());
+    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-Bold.ttf").to_vec());
+    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-BoldItalic.ttf").to_vec());
 }

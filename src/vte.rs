@@ -1,5 +1,10 @@
-use bevy::math::UVec2;
 use compact_str::CompactString;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Position {
+    pub x: u32,
+    pub y: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamedColor {
@@ -55,7 +60,7 @@ pub enum AnsiColor {
 pub enum VteEvent {
     Echo(char),
     Backspace,
-    Goto(UVec2),
+    Goto(Position),
     GotoX(u32),
     GotoY(u32),
     LineUp(u32),
@@ -246,9 +251,7 @@ impl<T: VteHandler> Performer<T> {
                     }
                 }
 
-                _ => {
-                    bevy::prelude::info!("ignored SGR: {param}");
-                }
+                _ => {}
             }
             i += 1;
         }
@@ -320,9 +323,7 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
             b'\n' | b'\x0b' | b'\x0c' => self.state.vte_event(VteEvent::MoveDown(1)),
             0x0E => self.is_alt_charset = true,
             0x0F => self.is_alt_charset = false,
-            _ => {
-                bevy::prelude::info!("VTE execute: 0x{byte:02x}");
-            }
+            _ => {}
         }
     }
 
@@ -350,14 +351,11 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 self.state
                     .vte_event(VteEvent::Image(CompactString::from_utf8_lossy(image)));
             }
-            _ => {
-                bevy::prelude::info!("VTE OSC: {params:?}");
-            }
+            _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        bevy::prelude::info!("VTE ESC: intermediates={intermediates:?} byte=0x{byte:02x}");
         match (intermediates.first(), byte) {
             (None, b'7') => self.state.vte_event(VteEvent::SaveCursorPosition),
             (None, b'8') => self.state.vte_event(VteEvent::RestoreCursorPosition),
@@ -372,14 +370,10 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        intermediates: &[u8],
+        _intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
-        bevy::prelude::info!(
-            "CSI: action={action:?} params={params:?} intermediates={intermediates:?}"
-        );
-
         let mut flat_params = Vec::new();
         for p in params.iter() {
             for &subp in p {
@@ -439,23 +433,8 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
 
             's' => self.state.vte_event(VteEvent::SaveCursorPosition),
             'u' => self.state.vte_event(VteEvent::RestoreCursorPosition),
-            'h' | 'l' => {
-                bevy::prelude::info!("Private mode: {action} with params {params:?}");
-            }
-            _ => {
-                bevy::prelude::info!(
-                    "uncaught CSI: \\x1b[{}{action}",
-                    params
-                        .iter()
-                        .map(|p| p
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(":"))
-                        .collect::<Vec<_>>()
-                        .join(";")
-                );
-            }
+            'h' | 'l' => {}
+            _ => {}
         }
     }
 }
@@ -468,9 +447,9 @@ fn next_axis(iter: &mut impl Iterator<Item = u16>) -> u32 {
     next(iter).unwrap_or(1).max(1).into()
 }
 
-fn next_position(iter: &mut impl Iterator<Item = u16>) -> UVec2 {
+fn next_position(iter: &mut impl Iterator<Item = u16>) -> Position {
     let y = next_axis(iter);
     let x = next_axis(iter);
 
-    UVec2::new(x, y)
+    Position { x, y }
 }

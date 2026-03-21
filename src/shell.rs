@@ -33,7 +33,7 @@ fn program() -> OsString {
 
 #[cfg(not(unix))]
 fn program() -> OsString {
-    todo!()
+    "powershell.exe".into()
 }
 
 pub fn default() -> Command {
