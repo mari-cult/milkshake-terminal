@@ -6,6 +6,8 @@ use std::process::Command;
 pub struct GridSize {
     pub cols: u32,
     pub rows: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct PseudoTerminal {
@@ -51,6 +53,7 @@ mod platform {
     pub struct PlatformPty {
         control: Arc<File>,
         user: OwnedFd,
+        size: GridSize,
     }
 
     impl PlatformPty {
@@ -58,8 +61,8 @@ mod platform {
             let pty_size = Winsize {
                 ws_col: size.cols as u16,
                 ws_row: size.rows as u16,
-                ws_xpixel: (size.cols * 10) as u16,
-                ws_ypixel: (size.rows * 18) as u16,
+                ws_xpixel: size.width as u16,
+                ws_ypixel: size.height as u16,
             };
 
             let pty = rustix_openpty::openpty(None, Some(&pty_size))?;
@@ -75,7 +78,11 @@ mod platform {
                 let _ = tcsetattr(&user, OptionalActions::Now, &attrs);
             }
 
-            Ok(Self { control, user })
+            Ok(Self {
+                control,
+                user,
+                size,
+            })
         }
 
         pub fn spawn(&mut self, command: &mut Command) -> io::Result<()> {
@@ -100,11 +107,11 @@ mod platform {
             let pty_size = Winsize {
                 ws_col: size.cols as u16,
                 ws_row: size.rows as u16,
-                ws_xpixel: (size.cols * 10) as u16,
-                ws_ypixel: (size.rows * 18) as u16,
+                ws_xpixel: size.width as u16,
+                ws_ypixel: size.height as u16,
             };
 
-            rustix::termios::tcsetwinsize(&self.control, pty_size)?;
+            rustix::termios::tcsetwinsize(&self.user, pty_size)?;
             Ok(())
         }
 

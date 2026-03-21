@@ -3,6 +3,7 @@ name = "milkshake-terminal"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.93"
+license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -10,12 +11,15 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 compact_str = { version = "0.9.0", default-features = false }
-crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
-bytemuck = { version = "1.24.0", default-features = false, features = ["derive"] }
+crossbeam-channel = { version = "0.5.15", default-features = false, features = [
+    "std",
+] }
+bytemuck = { version = "1.24.0", default-features = false, features = [
+    "derive",
+] }
 fontdb = { version = "0.23.0", default-features = false, features = ["fs"] }
 libc = { version = "0.2.183", default-features = false }
 pollster = { version = "0.4.0", default-features = false }
-rustix-openpty = { version = "0.2.0", default-features = false }
 vte = { version = "0.15.0", default-features = false }
 glyphon = { git = "https://github.com/RuairidhWilliamson/glyphon", branch = "wgpu-29" }
 wgpu = { version = "29.0.0", default-features = false, features = [
@@ -25,6 +29,14 @@ wgpu = { version = "29.0.0", default-features = false, features = [
     "dx12",
 ] }
 winit = { version = "0.31.0-beta.2", default-features = false }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+rustix-openpty = { version = "0.2.0", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", default-features = false, features = [
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dependencies.image]
 version = "0.25.10"

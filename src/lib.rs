@@ -5,17 +5,17 @@ use crate::vte::{AnsiColor, Intensity, NamedColor, Position, StandardColor, Vte,
 use bytemuck::{Pod, Zeroable};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
-use image::GenericImageView;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
+use image::GenericImageView;
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
-use std::collections::VecDeque;
 use wgpu::{
     ColorTargetState, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
     DeviceDescriptor, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
@@ -26,20 +26,25 @@ use wgpu::{
     VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 mod convert;
+mod explosion;
+#[cfg(target_os = "macos")]
+mod macos_transparency;
 mod pseudo_terminal;
 mod shell;
 mod vte;
 
+use crate::explosion::ExplosionEffect;
+
 const HISTORY_ROWS: u32 = 1000;
-const CELL_WIDTH: f32 = 10.0;
+const CELL_WIDTH: f32 = 9.0;
 const CELL_HEIGHT: f32 = 18.0;
-const FONT_SIZE: f32 = 14.0;
+const FONT_SIZE: f32 = 15.0;
 
 const BG_SHADER: &str = r#"
 struct VertexInput {
@@ -248,7 +253,7 @@ struct TerminalModel {
 impl TerminalModel {
     fn new(cols: u32, viewport_rows: u32) -> Self {
         let cols = cols.max(1);
-        let viewport_rows = viewport_rows.max(1).min(HISTORY_ROWS);
+        let viewport_rows = viewport_rows.clamp(1, HISTORY_ROWS);
         Self {
             cols,
             viewport_rows,
@@ -264,7 +269,7 @@ impl TerminalModel {
 
     fn resize(&mut self, cols: u32, viewport_rows: u32) {
         let new_cols = cols.max(1);
-        let viewport_rows = viewport_rows.max(1).min(HISTORY_ROWS);
+        let viewport_rows = viewport_rows.clamp(1, HISTORY_ROWS);
         if new_cols != self.cols {
             let old_cols = self.cols;
             let old_row_start = self.row_start;
@@ -275,7 +280,8 @@ impl TerminalModel {
                 for x in 0..old_cols.min(new_cols) {
                     let old_physical_row = (old_row_start + y as usize) % HISTORY_ROWS as usize;
                     let old_idx = old_physical_row * old_cols as usize + x as usize;
-                    let new_idx = self.index(y, x);
+                    let new_physical_row = (self.row_start + y as usize) % HISTORY_ROWS as usize;
+                    let new_idx = new_physical_row * new_cols as usize + x as usize;
                     self.cells[new_idx] = old_cells[old_idx];
                 }
             }
@@ -841,6 +847,8 @@ struct WindowState {
     terminal_pty: PseudoTerminal,
     reader: Receiver<VteEvent>,
     writer: Sender<CompactString>,
+
+    explosion: Option<ExplosionEffect>,
 }
 
 impl WindowState {
@@ -885,7 +893,12 @@ impl WindowState {
         } else {
             caps.present_modes[0]
         };
-        let alpha_mode = if caps.alpha_modes.contains(&CompositeAlphaMode::Opaque) {
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&CompositeAlphaMode::PostMultiplied)
+        {
+            CompositeAlphaMode::PostMultiplied
+        } else if caps.alpha_modes.contains(&CompositeAlphaMode::Opaque) {
             CompositeAlphaMode::Opaque
         } else {
             caps.alpha_modes[0]
@@ -928,19 +941,19 @@ impl WindowState {
                 match pty_reader.read(&mut bytes) {
                     Ok(0) => {
                         if !redraw_pending.swap(true, Ordering::AcqRel) {
-                            let _ = proxy.wake_up();
+                            proxy.wake_up();
                         }
                         break;
                     }
                     Ok(amount) => {
                         parser.process(&bytes[..amount]);
                         if !redraw_pending.swap(true, Ordering::AcqRel) {
-                            let _ = proxy.wake_up();
+                            proxy.wake_up();
                         }
                     }
                     Err(_) => {
                         if !redraw_pending.swap(true, Ordering::AcqRel) {
-                            let _ = proxy.wake_up();
+                            proxy.wake_up();
                         }
                         break;
                     }
@@ -980,6 +993,7 @@ impl WindowState {
             terminal_pty,
             reader: reader_rx,
             writer: writer_tx,
+            explosion: None,
         })
     }
 
@@ -994,8 +1008,11 @@ impl WindowState {
 
         self.scale_factor = self.window.scale_factor();
         let grid = grid_from_pixels(width, height, self.scale_factor);
+
         self.terminal.resize(grid.cols, grid.rows);
-        let _ = self.terminal_pty.resize(grid);
+        if let Err(e) = self.terminal_pty.resize(grid) {
+            eprintln!("Failed to resize PTY: {}", e);
+        }
         self.ensure_line_buffers(grid.rows, grid.cols);
         self.content_dirty = true;
     }
@@ -1120,12 +1137,9 @@ impl WindowState {
                 row_spans.push(self.row_spans(y));
                 let mut text = String::with_capacity(self.terminal.cols as usize);
                 for col in 0..self.terminal.cols {
-                    text.push(self.terminal.get(y, col).ch);
-                }
-                row_texts.push(text);
-
-                for col in 0..self.terminal.cols {
                     let cell = self.terminal.get(y, col);
+                    let mut drawn_custom = false;
+
                     if let Some(bg) = cell.style.bg {
                         append_bg_quad(
                             &mut bg_vertices,
@@ -1138,7 +1152,30 @@ impl WindowState {
                             bg,
                         );
                     }
+
+                    if is_custom_block(cell.ch) {
+                        let fg = Rgba {
+                            r: cell.style.fg.r,
+                            g: cell.style.fg.g,
+                            b: cell.style.fg.b,
+                            a: cell.style.fg.a,
+                        };
+                        drawn_custom = append_custom_block(
+                            &mut bg_vertices,
+                            self.surface_config.width as f32,
+                            self.surface_config.height as f32,
+                            col as f32 * cell_width,
+                            row as f32 * cell_height,
+                            cell_width,
+                            cell_height,
+                            cell.ch,
+                            fg,
+                        );
+                    }
+
+                    text.push(if drawn_custom { ' ' } else { cell.ch });
                 }
+                row_texts.push(text);
             }
 
             for (row, spans) in row_spans.iter().enumerate() {
@@ -1304,10 +1341,315 @@ impl WindowState {
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
-        self.atlas.trim();
         if self.cursor.update() {
             self.window.request_redraw();
         }
+    }
+
+    fn capture_frame_and_start_explosion(&mut self) {
+        let width = self.surface_config.width.max(1);
+        let height = self.surface_config.height.max(1);
+
+        let capture_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("explosion-capture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.content_dirty = true;
+        self.pump_terminal();
+
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.surface_config.width,
+                height: self.surface_config.height,
+            },
+        );
+
+        let view_top = self.terminal.current_view_top();
+        let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
+        self.ensure_line_buffers(self.terminal.viewport_rows, self.terminal.cols);
+        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+
+        {
+            let mut row_spans = Vec::with_capacity(view_rows as usize);
+            let mut row_texts = Vec::with_capacity(view_rows as usize);
+            let mut bg_vertices = Vec::new();
+
+            for row in 0..view_rows {
+                let y = view_top + row;
+                row_spans.push(self.row_spans(y));
+                let mut text = String::with_capacity(self.terminal.cols as usize);
+                for col in 0..self.terminal.cols {
+                    let cell = self.terminal.get(y, col);
+                    let mut drawn_custom = false;
+
+                    if let Some(bg) = cell.style.bg {
+                        append_bg_quad(
+                            &mut bg_vertices,
+                            self.surface_config.width as f32,
+                            self.surface_config.height as f32,
+                            col as f32 * cell_width,
+                            row as f32 * cell_height,
+                            cell_width,
+                            cell_height,
+                            bg,
+                        );
+                    }
+
+                    if is_custom_block(cell.ch) {
+                        let fg = Rgba {
+                            r: cell.style.fg.r,
+                            g: cell.style.fg.g,
+                            b: cell.style.fg.b,
+                            a: cell.style.fg.a,
+                        };
+                        drawn_custom = append_custom_block(
+                            &mut bg_vertices,
+                            self.surface_config.width as f32,
+                            self.surface_config.height as f32,
+                            col as f32 * cell_width,
+                            row as f32 * cell_height,
+                            cell_width,
+                            cell_height,
+                            cell.ch,
+                            fg,
+                        );
+                    }
+
+                    text.push(if drawn_custom { ' ' } else { cell.ch });
+                }
+                row_texts.push(text);
+            }
+
+            for (row, spans) in row_spans.iter().enumerate() {
+                let line_buffer = &mut self.line_buffers[row];
+                let default_attrs = Attrs::new()
+                    .family(Family::Monospace)
+                    .color(Color::rgba(255, 255, 255, 255));
+                line_buffer.set_rich_text(
+                    &mut self.font_system,
+                    spans
+                        .iter()
+                        .map(|(text, attrs)| (text.as_str(), attrs.clone())),
+                    &default_attrs,
+                    Shaping::Basic,
+                    None,
+                );
+                line_buffer.shape_until_scroll(&mut self.font_system, false);
+            }
+
+            let mut text_areas = Vec::with_capacity(view_rows as usize);
+            for (row, line_buffer) in self
+                .line_buffers
+                .iter()
+                .take(view_rows as usize)
+                .enumerate()
+            {
+                text_areas.push(TextArea {
+                    buffer: line_buffer,
+                    left: 0.0,
+                    top: row as f32 * cell_height,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: self.surface_config.width as i32,
+                        bottom: self.surface_config.height as i32,
+                    },
+                    default_color: Color::rgba(255, 255, 255, 255),
+                    custom_glyphs: &[],
+                });
+            }
+
+            self.bg_renderer
+                .prepare(&self.device, &self.queue, &bg_vertices);
+            let _ = self.text_renderer.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                text_areas,
+                &mut self.swash_cache,
+            );
+        }
+
+        let capture_view = capture_texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("explosion-capture-encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("explosion-capture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &capture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.bg_renderer.render(&mut pass);
+            let _ = self
+                .text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass);
+            for image in &self.images {
+                image.render(&mut pass);
+            }
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let win_pos = self.window.outer_position().unwrap_or_default();
+        let win_surface = self.window.surface_size();
+        let win_outer = self.window.outer_size();
+        let titlebar_h = win_outer.height.saturating_sub(win_surface.height);
+        let content_x = win_pos.x as f32;
+        let content_y = (win_pos.y as u32 + titlebar_h) as f32;
+        let ww = win_surface.width as f32;
+        let wh = win_surface.height as f32;
+
+        let (sw, sh, mx, my) = if let Some(mon) = self.window.current_monitor() {
+            let vm = mon.current_video_mode();
+            let ms = vm.as_ref().map(|v| v.size()).unwrap_or(win_surface);
+            let mp = mon.position().unwrap_or_default();
+            (ms.width as f32, ms.height as f32, mp.x as f32, mp.y as f32)
+        } else {
+            (ww, wh, content_x, content_y)
+        };
+
+        let wx = content_x - mx;
+        let wy = content_y - my;
+        let scale_x = ww / sw;
+        let scale_y = wh / sh;
+        let offset_x = (2.0 * wx + ww) / sw - 1.0;
+        let offset_y = 1.0 - (2.0 * wy + wh) / sh;
+
+        self.window.set_decorations(false);
+        self.window
+            .set_outer_position(winit::dpi::Position::Physical(PhysicalPosition::new(
+                mx as i32, my as i32,
+            )));
+        let _ = self
+            .window
+            .request_surface_size(PhysicalSize::new(sw as u32, sh as u32).into());
+        self.surface_config.width = sw as u32;
+        self.surface_config.height = sh as u32;
+
+        self.surface_config.alpha_mode = CompositeAlphaMode::PostMultiplied;
+
+        #[cfg(target_os = "macos")]
+        let ns_view_ptr = {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = self.window.window_handle() {
+                if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+                    let ptr = appkit.ns_view.as_ptr();
+                    unsafe {
+                        macos_transparency::make_window_transparent(ptr);
+                    }
+                    Some(ptr)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        self.surface.configure(&self.device, &self.surface_config);
+
+        #[cfg(target_os = "macos")]
+        if let Some(ptr) = ns_view_ptr {
+            unsafe {
+                macos_transparency::make_window_transparent(ptr);
+            }
+        }
+
+        self.explosion = Some(ExplosionEffect::new(
+            &self.device,
+            self.surface_config.format,
+            capture_texture,
+            scale_x,
+            scale_y,
+            offset_x,
+            offset_y,
+            sw,
+            sh,
+        ));
+    }
+
+    fn explosion_redraw(&mut self) {
+        let explosion = self.explosion.as_mut().unwrap();
+        explosion.update();
+        explosion.prepare(&self.device, &self.queue);
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return,
+        };
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("explosion-encoder"),
+            });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("explosion-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            explosion.render(&mut pass);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
     }
 
     fn row_spans(&self, y: u32) -> Vec<(String, Attrs<'static>)> {
@@ -1316,13 +1658,19 @@ impl WindowState {
 
         for x in 0..self.terminal.cols {
             let cell = self.terminal.get(y, x);
+            let display_ch = if is_custom_block(cell.ch) {
+                ' '
+            } else {
+                cell.ch
+            };
+
             if current_style == Some(cell.style) {
                 if let Some((text, _)) = spans.last_mut() {
-                    text.push(cell.ch);
+                    text.push(display_ch);
                 }
             } else {
                 current_style = Some(cell.style);
-                spans.push((cell.ch.to_string(), attrs_from_style(cell.style)));
+                spans.push((display_ch.to_string(), attrs_from_style(cell.style)));
             }
         }
 
@@ -1337,6 +1685,7 @@ struct App {
     state: Option<WindowState>,
     proxy: EventLoopProxy,
     redraw_pending: Arc<AtomicBool>,
+    exploding: bool,
 }
 
 impl ApplicationHandler for App {
@@ -1347,7 +1696,8 @@ impl ApplicationHandler for App {
 
         let attributes = WindowAttributes::default()
             .with_title("milkshake-terminal")
-            .with_surface_size(LogicalSize::new(1200.0, 720.0));
+            .with_surface_size(LogicalSize::new(1200.0, 720.0))
+            .with_transparent(true);
         let window = Arc::from(event_loop.create_window(attributes).expect("create window"));
 
         match pollster::block_on(WindowState::new(
@@ -1355,7 +1705,11 @@ impl ApplicationHandler for App {
             self.proxy.clone(),
             self.redraw_pending.clone(),
         )) {
-            Ok(state) => self.state = Some(state),
+            Ok(mut state) => {
+                let size = state.window.surface_size();
+                state.resize(size.width, size.height);
+                self.state = Some(state);
+            }
             Err(err) => {
                 eprintln!("failed to initialize terminal: {err}");
                 event_loop.exit();
@@ -1369,9 +1723,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {
-        // Event-driven rendering: redraw is requested only by input/resize/proxy wake-up.
-    }
+    fn about_to_wait(&mut self, _event_loop: &dyn ActiveEventLoop) {}
 
     fn window_event(
         &mut self,
@@ -1384,21 +1736,34 @@ impl ApplicationHandler for App {
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::SurfaceResized(size) => {
+            WindowEvent::CloseRequested if !self.exploding => {
+                self.exploding = true;
+                state.capture_frame_and_start_explosion();
+                state.window.request_redraw();
+            }
+            WindowEvent::SurfaceResized(size) if !self.exploding => {
                 state.resize(size.width, size.height);
                 state.window.request_redraw();
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !self.exploding => {
                 state.handle_mouse_wheel(delta);
                 state.window.request_redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !self.exploding => {
                 state.handle_keyboard(&event);
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.redraw();
+                if self.exploding {
+                    state.explosion_redraw();
+                    if state.explosion.as_ref().is_some_and(|e| e.finished) {
+                        event_loop.exit();
+                    } else {
+                        state.window.request_redraw();
+                    }
+                } else {
+                    state.redraw();
+                }
                 self.redraw_pending.store(false, Ordering::Release);
             }
             _ => {}
@@ -1413,6 +1778,7 @@ pub fn main() {
         state: None,
         proxy,
         redraw_pending: Arc::new(AtomicBool::new(false)),
+        exploding: false,
     };
     event_loop.run_app(app).expect("run app");
 }
@@ -1430,6 +1796,8 @@ fn grid_from_pixels(width: u32, height: u32, scale_factor: f64) -> GridSize {
     GridSize {
         cols: ((width as f32 / cell_width).floor() as u32).max(1),
         rows: ((height as f32 / cell_height).floor() as u32).max(1),
+        width,
+        height,
     }
 }
 
@@ -1503,6 +1871,184 @@ fn cursor_x_from_shaped_line(
     }
 }
 
+pub fn is_custom_block(ch: char) -> bool {
+    let u = ch as u32;
+    if (0x2800..=0x28FF).contains(&u) {
+        return true;
+    }
+    matches!(
+        ch,
+        '▀' | '▄'
+            | '█'
+            | '▌'
+            | '▐'
+            | '│'
+            | '─'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+    )
+}
+
+fn append_custom_block(
+    vertices: &mut Vec<BgVertex>,
+    surface_width: f32,
+    surface_height: f32,
+    base_x: f32,
+    base_y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    ch: char,
+    fg: Rgba,
+) -> bool {
+    let u = ch as u32;
+    // Braille: 0x2800..=0x28FF
+    if (0x2800..=0x28FF).contains(&u) {
+        let offset = u - 0x2800;
+        let dot_w = cell_width / 2.0;
+        let dot_h = cell_height / 4.0;
+        let margin_x = dot_w * 0.15;
+        let margin_y = dot_h * 0.15;
+
+        let mut add_dot = |dx: f32, dy: f32| {
+            append_bg_quad(
+                vertices,
+                surface_width,
+                surface_height,
+                base_x + dx * dot_w + margin_x,
+                base_y + dy * dot_h + margin_y,
+                dot_w - margin_x * 2.0,
+                dot_h - margin_y * 2.0,
+                fg,
+            );
+        };
+
+        if (offset & 0x1) != 0 {
+            add_dot(0.0, 0.0);
+        }
+        if (offset & 0x2) != 0 {
+            add_dot(0.0, 1.0);
+        }
+        if (offset & 0x4) != 0 {
+            add_dot(0.0, 2.0);
+        }
+        if (offset & 0x8) != 0 {
+            add_dot(1.0, 0.0);
+        }
+        if (offset & 0x10) != 0 {
+            add_dot(1.0, 1.0);
+        }
+        if (offset & 0x20) != 0 {
+            add_dot(1.0, 2.0);
+        }
+        if (offset & 0x40) != 0 {
+            add_dot(0.0, 3.0);
+        }
+        if (offset & 0x80) != 0 {
+            add_dot(1.0, 3.0);
+        }
+        return true;
+    }
+
+    let mut draw = |x: f32, y: f32, w: f32, h: f32| {
+        append_bg_quad(
+            vertices,
+            surface_width,
+            surface_height,
+            base_x + x,
+            base_y + y,
+            w,
+            h,
+            fg,
+        );
+    };
+
+    match ch {
+        '▀' => draw(0.0, 0.0, cell_width, cell_height / 2.0),
+        '▄' => draw(0.0, cell_height / 2.0, cell_width, cell_height / 2.0),
+        '█' => draw(0.0, 0.0, cell_width, cell_height),
+        '▌' => draw(0.0, 0.0, cell_width / 2.0, cell_height),
+        '▐' => draw(cell_width / 2.0, 0.0, cell_width / 2.0, cell_height),
+
+        '│' => draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height),
+        '─' => draw(0.0, cell_height / 2.0 - 0.5, cell_width, 1.0),
+        '┌' => {
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                1.0,
+                cell_height / 2.0 + 0.5,
+            );
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                cell_width / 2.0 + 0.5,
+                1.0,
+            );
+        }
+        '┐' => {
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                1.0,
+                cell_height / 2.0 + 0.5,
+            );
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width / 2.0 + 0.5, 1.0);
+        }
+        '└' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height / 2.0 + 0.5);
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                cell_width / 2.0 + 0.5,
+                1.0,
+            );
+        }
+        '┘' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height / 2.0 + 0.5);
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width / 2.0 + 0.5, 1.0);
+        }
+        '├' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height);
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                cell_width / 2.0 + 0.5,
+                1.0,
+            );
+        }
+        '┤' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height);
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width / 2.0 + 0.5, 1.0);
+        }
+        '┬' => {
+            draw(
+                cell_width / 2.0 - 0.5,
+                cell_height / 2.0 - 0.5,
+                1.0,
+                cell_height / 2.0 + 0.5,
+            );
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width, 1.0);
+        }
+        '┴' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height / 2.0 + 0.5);
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width, 1.0);
+        }
+        '┼' => {
+            draw(cell_width / 2.0 - 0.5, 0.0, 1.0, cell_height);
+            draw(0.0, cell_height / 2.0 - 0.5, cell_width, 1.0);
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn attrs_from_style(style: CellStyle) -> Attrs<'static> {
     let weight = if style.bold {
         Weight::BOLD
@@ -1516,6 +2062,9 @@ fn attrs_from_style(style: CellStyle) -> Attrs<'static> {
     };
 
     Attrs::new()
+        .family(Family::Name("Menlo"))
+        .family(Family::Name("Monaco"))
+        .family(Family::Name("Courier New"))
         .family(Family::Monospace)
         .color(Color::rgba(style.fg.r, style.fg.g, style.fg.b, style.fg.a))
         .weight(weight)
@@ -1634,8 +2183,5 @@ fn index_to_color(index: u8) -> Rgba {
 
 fn load_embedded_fonts(font_system: &mut FontSystem) {
     let db = font_system.db_mut();
-    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-SemiBold.ttf").to_vec());
-    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-SemiBoldItalic.ttf").to_vec());
-    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-Bold.ttf").to_vec());
-    db.load_font_data(include_bytes!("../assets/fonts/RobotoMono-BoldItalic.ttf").to_vec());
+    db.load_font_data(include_bytes!("../assets/fonts/FiraCode.ttc").to_vec());
 }

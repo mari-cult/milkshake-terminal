@@ -399,9 +399,10 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 .vte_event(VteEvent::LineDown(next_axis(&mut iter))),
             'F' => self.state.vte_event(VteEvent::LineUp(next_axis(&mut iter))),
 
-            'G' => self
+            'G' | '`' => self
                 .state
                 .vte_event(VteEvent::GotoX(next_axis(&mut iter) - 1)),
+            'd' => self.state.vte_event(VteEvent::GotoY(next_axis(&mut iter))),
             'H' | 'f' => self
                 .state
                 .vte_event(VteEvent::Goto(next_position(&mut iter))),
