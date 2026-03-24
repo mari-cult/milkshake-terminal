@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use ttf_parser::{Face, OutlineBuilder};
 
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::PathBuf;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -11,6 +14,8 @@ pub struct TextVertex {
     pub color: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlyphInfo {
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
@@ -120,8 +125,24 @@ fn point_line_distance(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> 
 }
 
 pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u8]) -> FontAtlas {
-    let face = Face::parse(font_data, 4).unwrap_or_else(|_| Face::parse(font_data, 0).unwrap());
     let start = std::time::Instant::now();
+
+    let mut hasher = Sha256::new();
+    hasher.update(font_data);
+    let font_hash = hasher.finalize();
+    let cache_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join("Library/Caches/milkshake-terminal"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/milkshake-terminal"));
+    let cache_path = cache_dir.join(format!("{:x}.bin", font_hash));
+
+    if let Ok(cached_data) = fs::read(&cache_path)
+        && let Some(atlas) = load_atlas_from_cache(device, queue, &cached_data)
+    {
+        println!("Atlas loaded from cache in: {:?}", start.elapsed());
+        return atlas;
+    }
+
+    let face = Face::parse(font_data, 4).unwrap_or_else(|_| Face::parse(font_data, 0).unwrap());
 
     let units_per_em = face.units_per_em() as f32;
     let ascender = face.ascender() as f32;
@@ -135,7 +156,6 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
     let atlas_height = grid_size * cell_res;
     let mut pixels = vec![0u8; (atlas_width * atlas_height) as usize];
 
-    // We'll generate up to 2048 glyphs for start, or all available
     let total_face_glyphs = face.number_of_glyphs();
     let num_glyphs = total_face_glyphs.min((grid_size * grid_size) as u16);
 
@@ -177,7 +197,6 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
                             );
                             min_dist_sq = min_dist_sq.min(d * d);
 
-                            // Ray casting
                             if ((seg.p0[1] <= fy) && (seg.p1[1] > fy))
                                 || ((seg.p1[1] <= fy) && (seg.p0[1] > fy))
                             {
@@ -321,7 +340,28 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
         ],
     });
 
-    let atlas = FontAtlas {
+    let mut cache_data = Vec::new();
+    cache_data.extend_from_slice(b"MSAT");
+    cache_data.extend_from_slice(&2u32.to_le_bytes());
+    cache_data.extend_from_slice(&(glyphs_info.len() as u32).to_le_bytes());
+    cache_data.extend_from_slice(&units_per_em.to_le_bytes());
+    cache_data.extend_from_slice(&ascender.to_le_bytes());
+    cache_data.extend_from_slice(&descender.to_le_bytes());
+    cache_data.extend_from_slice(&padding_units.to_le_bytes());
+    cache_data.extend_from_slice(&atlas_width.to_le_bytes());
+    cache_data.extend_from_slice(&atlas_height.to_le_bytes());
+
+    for (&id, info) in &glyphs_info {
+        cache_data.extend_from_slice(&id.to_le_bytes());
+        cache_data.extend_from_slice(&[0u8, 0u8]); // Padding for alignment
+        cache_data.extend_from_slice(bytemuck::bytes_of(info));
+    }
+    cache_data.extend_from_slice(&pixels);
+
+    let _ = fs::create_dir_all(&cache_dir);
+    let _ = fs::write(&cache_path, cache_data);
+
+    FontAtlas {
         texture,
         bind_group,
         glyphs: glyphs_info,
@@ -329,9 +369,126 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
         ascender,
         descender,
         padding: padding_units,
+    }
+}
+
+fn load_atlas_from_cache(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[u8],
+) -> Option<FontAtlas> {
+    if data.len() < 40 || &data[0..4] != b"MSAT" {
+        return None;
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    if version != 2 {
+        return None;
+    }
+
+    let num_glyphs = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    let units_per_em = f32::from_le_bytes(data[12..16].try_into().ok()?);
+    let ascender = f32::from_le_bytes(data[16..20].try_into().ok()?);
+    let descender = f32::from_le_bytes(data[20..24].try_into().ok()?);
+    let padding = f32::from_le_bytes(data[24..28].try_into().ok()?);
+    let atlas_width = u32::from_le_bytes(data[28..32].try_into().ok()?);
+    let atlas_height = u32::from_le_bytes(data[32..36].try_into().ok()?);
+
+    let mut glyphs = HashMap::new();
+    let mut offset = 36;
+    for _ in 0..num_glyphs {
+        let id = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?);
+        offset += 4; // Skip ID and padding
+        let info_len = std::mem::size_of::<GlyphInfo>();
+        let info: GlyphInfo = *bytemuck::from_bytes(&data[offset..offset + info_len]);
+        offset += info_len;
+        glyphs.insert(id, info);
+    }
+
+    let pixels = &data[offset..];
+    if pixels.len() != (atlas_width * atlas_height) as usize {
+        return None;
+    }
+
+    let texture_size = wgpu::Extent3d {
+        width: atlas_width,
+        height: atlas_height,
+        depth_or_array_layers: 1,
     };
-    println!("Atlas generated in: {:?}", start.elapsed());
-    atlas
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("SDF Atlas Cached"),
+        size: texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        texture.as_image_copy(),
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(atlas_width),
+            rows_per_image: Some(atlas_height),
+        },
+        texture_size,
+    );
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("SDF Atlas Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SDF Atlas Bind Group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    Some(FontAtlas {
+        texture,
+        bind_group,
+        glyphs,
+        units_per_em,
+        ascender,
+        descender,
+        padding,
+    })
 }
 
 pub struct SDFTextRenderer {
@@ -473,20 +630,11 @@ impl SDFTextRenderer {
                 let gw = info.size[0] * em_scale;
                 let gh = info.size[1] * em_scale;
 
-                // MONOSPACE ALIGNMENT:
-                // Force glyph to be centered in cell_w
-                // Use a common baseline (ascender)
-                let base_y = y + atlas.ascender * em_scale;
+                let advance_width = info.advance * em_scale;
+                let h_padding = (cell_w - advance_width) / 2.0;
 
-                // Centering math:
-                // The glyph's visual center in font units relative to its origin is (offset.x + size.x/2)
-                // We want to align this to the center of our grid cell (cell_w/2)
-                let glyph_center_x = (info.offset[0] + info.size[0] / 2.0) * em_scale;
-                let cell_center_x = cell_w / 2.0;
-                let dx = cell_center_x - glyph_center_x;
-
-                let gx = cur_x + dx;
-                let gy = base_y - (info.offset[1] + info.size[1]) * em_scale;
+                let gx = cur_x + h_padding + info.offset[0] * em_scale;
+                let gy = y + (atlas.ascender - info.offset[1] - info.size[1]) * em_scale;
 
                 let x0 = (gx / surface_w) * 2.0 - 1.0;
                 let x1 = ((gx + gw) / surface_w) * 2.0 - 1.0;

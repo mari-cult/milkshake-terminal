@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 use text::{FontAtlas, SDFTextRenderer, generate_atlas};
+use vte::MouseMode;
 use wgpu::{
     ColorTargetState, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
     DeviceDescriptor, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
@@ -27,6 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 mod convert;
@@ -251,6 +253,9 @@ struct TerminalModel {
     saved_cursor: Option<CursorPos>,
     scroll_offset: i32,
     image_logged: bool,
+    mouse_mode: MouseMode,
+    mouse_protocol_sgr: bool,
+    focus_reporting: bool,
 }
 
 impl TerminalModel {
@@ -267,6 +272,9 @@ impl TerminalModel {
             saved_cursor: None,
             scroll_offset: 0,
             image_logged: false,
+            mouse_mode: MouseMode::None,
+            mouse_protocol_sgr: false,
+            focus_reporting: false,
         }
     }
 
@@ -354,7 +362,7 @@ impl TerminalModel {
     fn apply_vte_event(
         &mut self,
         event: VteEvent,
-        writer: &Sender<CompactString>,
+        writer: &Sender<Vec<u8>>,
         on_image: &mut dyn FnMut(CompactString),
     ) {
         let current_screen_top = self.current_screen_top();
@@ -422,7 +430,13 @@ impl TerminalModel {
                 let row_in_view = self.cursor.y as i32 - current_screen_top as i32 + 1;
                 let col_in_view = self.cursor.x + 1;
                 let response = format!("\x1b[{row_in_view};{col_in_view}R");
-                let _ = writer.send(response.into());
+                let _ = writer.send(response.into_bytes());
+            }
+            VteEvent::ReportDeviceAttributes => {
+                let _ = writer.send(b"\x1b[?1;2c".to_vec());
+            }
+            VteEvent::ReportVersion => {
+                let _ = writer.send(b"\x1b[>1;256;0c".to_vec());
             }
             VteEvent::Reset => self.style = CellStyle::default(),
             VteEvent::Bold => self.style.bold = true,
@@ -472,6 +486,34 @@ impl TerminalModel {
             VteEvent::Image(image) => {
                 on_image(image);
             }
+            VteEvent::EnableMouseMode(mode) => match mode {
+                MouseMode::Sgr => self.mouse_protocol_sgr = true,
+                _ => self.mouse_mode = mode,
+            },
+            VteEvent::DisableMouseMode(mode) => match mode {
+                MouseMode::Sgr => self.mouse_protocol_sgr = false,
+                _ => {
+                    if self.mouse_mode == mode {
+                        self.mouse_mode = MouseMode::None;
+                    }
+                }
+            },
+            VteEvent::EnableAlternativeBuffer => {
+                self.clear_all();
+                self.cursor = CursorPos {
+                    x: 0,
+                    y: current_screen_top,
+                };
+            }
+            VteEvent::DisableAlternativeBuffer => {
+                self.clear_all();
+                self.cursor = CursorPos {
+                    x: 0,
+                    y: current_screen_top,
+                };
+            }
+            VteEvent::EnableFocusReporting => self.focus_reporting = true,
+            VteEvent::DisableFocusReporting => self.focus_reporting = false,
             _ => {}
         }
 
@@ -844,9 +886,12 @@ struct WindowState {
     terminal: TerminalModel,
     terminal_pty: PseudoTerminal,
     reader: Receiver<VteEvent>,
-    writer: Sender<CompactString>,
+    writer: Sender<Vec<u8>>,
 
     explosion: Option<ExplosionEffect>,
+    last_mouse_pos: (u32, u32),
+    modifiers: ModifiersState,
+    is_mouse_down: bool,
 }
 
 impl WindowState {
@@ -886,11 +931,7 @@ impl WindowState {
             .find(TextureFormat::is_srgb)
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| io::Error::other("no surface format available"))?;
-        let present_mode = if caps.present_modes.contains(&PresentMode::Fifo) {
-            PresentMode::Fifo
-        } else {
-            caps.present_modes[0]
-        };
+        let present_mode = PresentMode::AutoVsync;
         let alpha_mode = if caps
             .alpha_modes
             .contains(&CompositeAlphaMode::PostMultiplied)
@@ -952,11 +993,11 @@ impl WindowState {
             }
         });
 
-        let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<CompactString>();
+        let (writer_tx, writer_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let mut pty_writer = terminal_pty.writer()?;
         thread::spawn(move || {
             for payload in writer_rx {
-                let _ = pty_writer.write_all(payload.as_bytes());
+                let _ = pty_writer.write_all(&payload);
                 let _ = pty_writer.flush();
             }
         });
@@ -981,6 +1022,9 @@ impl WindowState {
             reader: reader_rx,
             writer: writer_tx,
             explosion: None,
+            last_mouse_pos: (0, 0),
+            modifiers: ModifiersState::default(),
+            is_mouse_down: false,
         })
     }
 
@@ -1009,14 +1053,47 @@ impl WindowState {
             return;
         }
 
+        let ctrl = self.modifiers.control_key();
+        if ctrl
+            && let Key::Character(c) = &event.logical_key
+            && let Some(c) = c.chars().next()
+            && c.is_ascii_alphabetic()
+        {
+            let code = (c.to_ascii_uppercase() as u8) - b'@';
+            let _ = self.writer.send(vec![code]);
+            return;
+        }
+
         if let Some(payload) =
             convert::convert_key(&event.logical_key.as_ref(), event.text.as_deref())
         {
-            let _ = self.writer.send(payload);
+            let _ = self.writer.send(payload.as_bytes().to_vec());
         }
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.terminal.mouse_mode != MouseMode::None {
+            let btn = match delta {
+                MouseScrollDelta::LineDelta(_, y) => {
+                    if y > 0.0 {
+                        64
+                    } else {
+                        65
+                    }
+                }
+                MouseScrollDelta::PixelDelta(pos) => {
+                    if pos.y > 0.0 {
+                        64
+                    } else {
+                        65
+                    }
+                }
+            };
+            let (x, y) = self.last_mouse_pos;
+            self.report_mouse(btn, x, y, true);
+            return;
+        }
+
         let previous = self.terminal.scroll_offset;
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => y as i32,
@@ -1029,6 +1106,86 @@ impl WindowState {
             (self.terminal.scroll_offset + lines).clamp(0, self.terminal.screen_top() as i32);
         if self.terminal.scroll_offset != previous {
             self.content_dirty = true;
+        }
+    }
+
+    fn handle_cursor_moved(&mut self, pos: PhysicalPosition<f64>) {
+        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+        let x = (pos.x as f32 / cell_width).floor() as u32;
+        let y = (pos.y as f32 / cell_height).floor() as u32;
+        self.last_mouse_pos = (x, y);
+
+        let is_any = self.terminal.mouse_mode == MouseMode::AnyMotion;
+        let is_btn = self.terminal.mouse_mode == MouseMode::ButtonMotion && self.is_mouse_down;
+
+        if is_any || is_btn {
+            self.report_mouse(32, x, y, true);
+        }
+    }
+
+    fn handle_mouse_input(
+        &mut self,
+        state: ElementState,
+        button: winit::event::MouseButton,
+        pos: PhysicalPosition<f64>,
+    ) {
+        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+        let x = (pos.x as f32 / cell_width).floor() as u32;
+        let y = (pos.y as f32 / cell_height).floor() as u32;
+        self.last_mouse_pos = (x, y);
+
+        self.is_mouse_down = state == ElementState::Pressed;
+
+        let btn = match button {
+            winit::event::MouseButton::Left => 0,
+            winit::event::MouseButton::Middle => 1,
+            winit::event::MouseButton::Right => 2,
+            _ => return,
+        };
+        self.report_mouse(btn, x, y, state == ElementState::Pressed);
+    }
+
+    fn report_mouse(&mut self, button: u32, x: u32, y: u32, pressed: bool) {
+        if self.terminal.mouse_mode == MouseMode::None {
+            return;
+        }
+
+        let x = x.min(self.terminal.cols - 1);
+        let y = y.min(self.terminal.viewport_rows - 1);
+
+        let mut b = button;
+        if self.modifiers.shift_key() {
+            b |= 4;
+        }
+        if self.modifiers.alt_key() {
+            b |= 8;
+        }
+        if self.modifiers.control_key() {
+            b |= 16;
+        }
+
+        if self.terminal.mouse_protocol_sgr {
+            let suffix = if pressed { 'M' } else { 'm' };
+            let report = format!("\x1b[<{};{};{}{}", b, x + 1, y + 1, suffix);
+            let _ = self.writer.send(report.into_bytes());
+        } else {
+            // Standard X11 mouse reporting
+            if x < 223 && y < 223 {
+                let mut data = Vec::with_capacity(6);
+                data.extend_from_slice(b"\x1b[M");
+                let b_val = if pressed { b } else { 3 | (b & 0x1c) };
+                data.push((b_val as u8).wrapping_add(32));
+                data.push((x as u8).wrapping_add(33));
+                data.push((y as u8).wrapping_add(33));
+                let _ = self.writer.send(data);
+            }
+        }
+    }
+
+    fn handle_focus(&mut self, focused: bool) {
+        if self.terminal.focus_reporting {
+            let escape = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            let _ = self.writer.send(escape.to_vec());
         }
     }
 
@@ -1668,6 +1825,27 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if !self.exploding => {
                 state.handle_keyboard(&event);
                 state.window.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.modifiers = modifiers.state();
+            }
+            WindowEvent::Focused(focused) => {
+                state.handle_focus(focused);
+            }
+            WindowEvent::PointerMoved { position, .. } if !self.exploding => {
+                state.handle_cursor_moved(position);
+            }
+            WindowEvent::PointerButton {
+                state: btn_state,
+                button,
+                position,
+                ..
+            } => {
+                if !self.exploding
+                    && let winit::event::ButtonSource::Mouse(mouse_btn) = button
+                {
+                    state.handle_mouse_input(btn_state, mouse_btn, position);
+                }
             }
             WindowEvent::RedrawRequested => {
                 if self.exploding {

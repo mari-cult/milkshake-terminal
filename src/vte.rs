@@ -75,7 +75,11 @@ pub enum VteEvent {
     DisableAlternativeBuffer,
     EnableBracketedPaste,
     DisableBracketedPaste,
+    EnableFocusReporting,
+    DisableFocusReporting,
     ReportCursorPosition,
+    ReportDeviceAttributes,
+    ReportVersion,
     Reset,
     Bold,
     Dim,
@@ -95,6 +99,17 @@ pub enum VteEvent {
     ClearDown,
     ClearAll,
     ClearEverything,
+    EnableMouseMode(MouseMode),
+    DisableMouseMode(MouseMode),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseMode {
+    None,
+    Normal,       // 1000
+    ButtonMotion, // 1002
+    AnyMotion,    // 1003
+    Sgr,          // 1006 (Protocol)
 }
 
 pub trait VteHandler {
@@ -370,7 +385,7 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
@@ -380,6 +395,7 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 flat_params.push(subp);
             }
         }
+
         let mut iter = flat_params.into_iter();
 
         match action {
@@ -432,9 +448,89 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 _ => {}
             },
 
+            'c' => {
+                let is_tertiary = intermediates.first() == Some(&b'>');
+                if is_tertiary {
+                    self.state.vte_event(VteEvent::ReportVersion);
+                } else {
+                    self.state.vte_event(VteEvent::ReportDeviceAttributes);
+                }
+            }
+
             's' => self.state.vte_event(VteEvent::SaveCursorPosition),
             'u' => self.state.vte_event(VteEvent::RestoreCursorPosition),
-            'h' | 'l' => {}
+            'h' | 'l' => {
+                let is_set = action == 'h';
+                let is_private = intermediates.first() == Some(&b'?');
+
+                if is_private {
+                    for param in iter {
+                        match param {
+                            1000 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::Normal));
+                                } else {
+                                    self.state
+                                        .vte_event(VteEvent::DisableMouseMode(MouseMode::Normal));
+                                }
+                            }
+                            1002 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableMouseMode(
+                                        MouseMode::ButtonMotion,
+                                    ));
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableMouseMode(
+                                        MouseMode::ButtonMotion,
+                                    ));
+                                }
+                            }
+                            1003 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::AnyMotion));
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableMouseMode(
+                                        MouseMode::AnyMotion,
+                                    ));
+                                }
+                            }
+                            1006 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::Sgr));
+                                } else {
+                                    self.state
+                                        .vte_event(VteEvent::DisableMouseMode(MouseMode::Sgr));
+                                }
+                            }
+                            1049 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableAlternativeBuffer);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableAlternativeBuffer);
+                                }
+                            }
+                            1004 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableFocusReporting);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableFocusReporting);
+                                }
+                            }
+                            2004 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableBracketedPaste);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableBracketedPaste);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
