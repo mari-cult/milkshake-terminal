@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::FONT_DATA;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TextVertex {
@@ -32,6 +34,7 @@ pub struct FontAtlas {
     pub ascender: f32,
     pub descender: f32,
     pub padding: f32,
+    pub ascii_cache: [Option<GlyphInfo>; 128],
 }
 
 struct PathSegment {
@@ -125,20 +128,24 @@ fn point_line_distance(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> 
 }
 
 pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u8]) -> FontAtlas {
-    let start = std::time::Instant::now();
-
     let mut hasher = Sha256::new();
     hasher.update(font_data);
     let font_hash = hasher.finalize();
-    let cache_dir = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join("Library/Caches/milkshake-terminal"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp/milkshake-terminal"));
+    let cache_dir = if cfg!(target_os = "macos") {
+        std::env::var("HOME").map(|h| PathBuf::from(h).join("Library/Caches/milkshake-terminal"))
+    } else {
+        std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache/milkshake-terminal"))
+            })
+    }
+    .unwrap_or_else(|_| PathBuf::from("/tmp/milkshake-terminal"));
     let cache_path = cache_dir.join(format!("{:x}.bin", font_hash));
 
     if let Ok(cached_data) = fs::read(&cache_path)
         && let Some(atlas) = load_atlas_from_cache(device, queue, &cached_data)
     {
-        println!("Atlas loaded from cache in: {:?}", start.elapsed());
         return atlas;
     }
 
@@ -148,7 +155,7 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
     let ascender = face.ascender() as f32;
     let descender = face.descender() as f32;
 
-    let grid_size: u32 = 48; // cells
+    let grid_size: u32 = 42; // cells
     let cell_res: u32 = 48; // pixels per cell side
     let padding_units = units_per_em * 0.15; // SDF padding
 
@@ -361,6 +368,15 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
     let _ = fs::create_dir_all(&cache_dir);
     let _ = fs::write(&cache_path, cache_data);
 
+    let mut ascii_cache = [None; 128];
+    for ch in 0..128u8 {
+        if let Some(id) = face.glyph_index(ch as char)
+            && let Some(info) = glyphs_info.get(&id.0)
+        {
+            ascii_cache[ch as usize] = Some(*info);
+        }
+    }
+
     FontAtlas {
         texture,
         bind_group,
@@ -369,6 +385,7 @@ pub fn generate_atlas(device: &wgpu::Device, queue: &wgpu::Queue, font_data: &[u
         ascender,
         descender,
         padding: padding_units,
+        ascii_cache,
     }
 }
 
@@ -480,6 +497,16 @@ fn load_atlas_from_cache(
         ],
     });
 
+    let mut ascii_cache = [None; 128];
+    let face = Face::parse(FONT_DATA, 4).unwrap_or_else(|_| Face::parse(FONT_DATA, 0).unwrap());
+    for ch in 0..128u8 {
+        if let Some(id) = face.glyph_index(ch as char)
+            && let Some(info) = glyphs.get(&id.0)
+        {
+            ascii_cache[ch as usize] = Some(*info);
+        }
+    }
+
     Some(FontAtlas {
         texture,
         bind_group,
@@ -488,6 +515,7 @@ fn load_atlas_from_cache(
         ascender,
         descender,
         padding,
+        ascii_cache,
     })
 }
 
@@ -618,13 +646,14 @@ impl SDFTextRenderer {
         let mut cur_x = x;
 
         for ch in text.chars() {
-            let glyph_id = if let Some(id) = face.glyph_index(ch) {
-                id.0
+            let info = if (ch as u32) < 128 {
+                atlas.ascii_cache[ch as usize]
             } else {
-                continue;
+                face.glyph_index(ch)
+                    .and_then(|id| atlas.glyphs.get(&id.0).copied())
             };
 
-            if let Some(info) = atlas.glyphs.get(&glyph_id)
+            if let Some(info) = info
                 && info.size[0] > 0.0
             {
                 let gw = info.size[0] * em_scale;
@@ -709,5 +738,84 @@ impl SDFTextRenderer {
         pass.set_bind_group(0, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.draw(0..self.vertex_count, 0..1);
+    }
+
+    pub fn layout_char(
+        atlas: &FontAtlas,
+        face: &Face,
+        ch: char,
+        gx_base: f32,
+        gy_base: f32,
+        cell_w: f32,
+        _cell_h: f32,
+        font_size: f32,
+        surface_w: f32,
+        surface_h: f32,
+        color: [f32; 4],
+        vertices: &mut Vec<TextVertex>,
+    ) {
+        let info = if (ch as u32) < 128 {
+            atlas.ascii_cache[ch as usize]
+        } else {
+            face.glyph_index(ch)
+                .and_then(|id| atlas.glyphs.get(&id.0).copied())
+        };
+
+        if let Some(info) = info
+            && info.size[0] > 0.0
+        {
+            let em_scale = font_size / atlas.units_per_em;
+            let gw = info.size[0] * em_scale;
+            let gh = info.size[1] * em_scale;
+
+            let advance_width = info.advance * em_scale;
+            let h_padding = (cell_w - advance_width) / 2.0;
+
+            let gx = gx_base + h_padding + info.offset[0] * em_scale;
+            let gy = gy_base + (atlas.ascender - info.offset[1] - info.size[1]) * em_scale;
+
+            let x0 = (gx / surface_w) * 2.0 - 1.0;
+            let x1 = ((gx + gw) / surface_w) * 2.0 - 1.0;
+            let y0 = 1.0 - (gy / surface_h) * 2.0;
+            let y1 = 1.0 - ((gy + gh) / surface_h) * 2.0;
+
+            let uv00 = [info.uv_min[0], info.uv_min[1]];
+            let uv10 = [info.uv_max[0], info.uv_min[1]];
+            let uv11 = [info.uv_max[0], info.uv_max[1]];
+            let uv01 = [info.uv_min[0], info.uv_max[1]];
+
+            vertices.extend_from_slice(&[
+                TextVertex {
+                    pos: [x0, y0],
+                    uv: uv00,
+                    color,
+                },
+                TextVertex {
+                    pos: [x1, y0],
+                    uv: uv10,
+                    color,
+                },
+                TextVertex {
+                    pos: [x1, y1],
+                    uv: uv11,
+                    color,
+                },
+                TextVertex {
+                    pos: [x0, y0],
+                    uv: uv00,
+                    color,
+                },
+                TextVertex {
+                    pos: [x1, y1],
+                    uv: uv11,
+                    color,
+                },
+                TextVertex {
+                    pos: [x0, y1],
+                    uv: uv01,
+                    color,
+                },
+            ]);
+        }
     }
 }

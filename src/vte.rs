@@ -101,6 +101,22 @@ pub enum VteEvent {
     ClearEverything,
     EnableMouseMode(MouseMode),
     DisableMouseMode(MouseMode),
+    InsertLine(u32),
+    DeleteLine(u32),
+    InsertCharacter(u32),
+    DeleteCharacter(u32),
+    EraseCharacter(u32),
+    FullReset,
+    ShowCursor,
+    HideCursor,
+    SetCursorStyle(u32),
+    SetMargin {
+        top: Option<u32>,
+        bottom: Option<u32>,
+    },
+    Index,
+    ReverseIndex,
+    NextLine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,10 +390,14 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
         match (intermediates.first(), byte) {
             (None, b'7') => self.state.vte_event(VteEvent::SaveCursorPosition),
             (None, b'8') => self.state.vte_event(VteEvent::RestoreCursorPosition),
+            (None, b'D') => self.state.vte_event(VteEvent::Index),
+            (None, b'M') => self.state.vte_event(VteEvent::ReverseIndex),
+            (None, b'E') => self.state.vte_event(VteEvent::NextLine),
             (Some(b'('), b'0') => self.is_alt_charset = true,
             (Some(b'('), b'B') => self.is_alt_charset = false,
             (Some(b')'), b'0') => self.is_alt_charset = true,
             (Some(b')'), b'B') => self.is_alt_charset = false,
+            (None, b'c') => self.state.vte_event(VteEvent::FullReset),
             _ => {}
         }
     }
@@ -423,6 +443,12 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 .state
                 .vte_event(VteEvent::Goto(next_position(&mut iter))),
 
+            'q' => {
+                let n = next(&mut iter).unwrap_or(0);
+                if intermediates.first() == Some(&b' ') {
+                    self.state.vte_event(VteEvent::SetCursorStyle(n as u32));
+                }
+            }
             'm' => {
                 let p_vec = iter.collect();
                 self.sgr_flat(p_vec);
@@ -447,6 +473,26 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 Some(2) => self.state.vte_event(VteEvent::ClearLine),
                 _ => {}
             },
+            'L' => self
+                .state
+                .vte_event(VteEvent::InsertLine(next_axis(&mut iter))),
+            'M' => self
+                .state
+                .vte_event(VteEvent::DeleteLine(next_axis(&mut iter))),
+            '@' => self
+                .state
+                .vte_event(VteEvent::InsertCharacter(next_axis(&mut iter))),
+            'P' => self
+                .state
+                .vte_event(VteEvent::DeleteCharacter(next_axis(&mut iter))),
+            'X' => self
+                .state
+                .vte_event(VteEvent::EraseCharacter(next_axis(&mut iter))),
+            'r' => {
+                let top = iter.next().map(|v| v as u32);
+                let bottom = iter.next().map(|v| v as u32);
+                self.state.vte_event(VteEvent::SetMargin { top, bottom });
+            }
 
             'c' => {
                 let is_tertiary = intermediates.first() == Some(&b'>');
@@ -517,6 +563,13 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                                     self.state.vte_event(VteEvent::EnableFocusReporting);
                                 } else {
                                     self.state.vte_event(VteEvent::DisableFocusReporting);
+                                }
+                            }
+                            25 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::ShowCursor);
+                                } else {
+                                    self.state.vte_event(VteEvent::HideCursor);
                                 }
                             }
                             2004 => {

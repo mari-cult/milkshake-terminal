@@ -22,6 +22,7 @@ pollster = { version = "0.4.0", default-features = false }
 vte = { version = "0.15.0", default-features = false }
 wgpu = { version = "29.0.0", default-features = false, features = [
     "wgsl",
+    "gles",
     "vulkan",
     "vulkan-portability",
     "metal",
@@ -30,6 +31,11 @@ winit = { version = "0.31.0-beta.2", default-features = false }
 ttf-parser = "0.25.1"
 rayon = "1.11.0"
 sha2 = "0.10.8"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.0"
+directories = "6.0.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 rustix-openpty = { version = "0.2.0", default-features = false }
@@ -51,10 +57,11 @@ features = ["libc", "process", "std", "termios"]
 
 [profile.dev]
 opt-level = 2
-strip = "symbols"
+split-debuginfo = "packed"
 
 [profile.dev.package."*"]
 opt-level = 3
+split-debuginfo = "packed"
 
 [features]
 default = ["wayland"]

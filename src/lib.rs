@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 
 use crate::pseudo_terminal::{GridSize, PseudoTerminal};
+use crate::text::TextVertex;
 use crate::vte::{AnsiColor, Intensity, NamedColor, Position, StandardColor, Vte, VteEvent};
 use bytemuck::{Pod, Zeroable};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 mod text;
 use image::GenericImageView;
+use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -16,36 +18,49 @@ use std::time::Instant;
 use text::{FontAtlas, SDFTextRenderer, generate_atlas};
 use vte::MouseMode;
 use wgpu::{
-    ColorTargetState, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
-    DeviceDescriptor, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
-    Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PresentMode, PrimitiveState,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, SurfaceConfiguration,
-    TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+    ColorTargetState, CompositeAlphaMode, CurrentSurfaceTexture, DeviceDescriptor, FragmentState,
+    Instance, LoadOp, MultisampleState, Operations, PipelineCompilationOptions,
+    PipelineLayoutDescriptor, PresentMode, PrimitiveState, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions,
+    ShaderModuleDescriptor, ShaderSource, SurfaceConfiguration, TextureFormat, TextureSampleType,
+    TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+mod bloom;
+mod config;
 mod convert;
-mod explosion;
 #[cfg(target_os = "macos")]
 mod macos_transparency;
 mod pseudo_terminal;
 mod shell;
 mod vte;
 
-use crate::explosion::ExplosionEffect;
+use crate::bloom::BloomRenderer;
+use crate::config::Config;
 
 const HISTORY_ROWS: u32 = 1000;
 const CELL_WIDTH: f32 = 9.0;
 const CELL_HEIGHT: f32 = 18.0;
 const FONT_SIZE: f32 = 15.0;
-const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/FiraCode.ttc");
+pub const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/FiraCode.ttc");
+static LINEAR_LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+
+fn get_linear_lut() -> &'static [f32; 256] {
+    LINEAR_LUT.get_or_init(|| {
+        let mut lut = [0.0; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = i as f32 / 255.0;
+        }
+        lut
+    })
+}
 
 const BG_SHADER: &str = r#"
 struct VertexInput {
@@ -181,6 +196,11 @@ impl AnimatedCursor {
         }
     }
 
+    fn snap(&mut self) {
+        self.position = self.target;
+        self.trail.clear();
+    }
+
     fn update(&mut self) -> bool {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
@@ -256,6 +276,12 @@ struct TerminalModel {
     mouse_mode: MouseMode,
     mouse_protocol_sgr: bool,
     focus_reporting: bool,
+    cursor_hidden: bool,
+    dirty_rows: Vec<bool>,
+    screen_top: u32,
+    margin_top: Option<u32>,
+    margin_bottom: Option<u32>,
+    is_alt_buffer: bool,
 }
 
 impl TerminalModel {
@@ -275,6 +301,12 @@ impl TerminalModel {
             mouse_mode: MouseMode::None,
             mouse_protocol_sgr: false,
             focus_reporting: false,
+            cursor_hidden: false,
+            dirty_rows: vec![true; HISTORY_ROWS as usize],
+            screen_top: 0,
+            margin_top: None,
+            margin_bottom: None,
+            is_alt_buffer: false,
         }
     }
 
@@ -301,7 +333,10 @@ impl TerminalModel {
         }
 
         self.viewport_rows = viewport_rows;
-        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top() as i32);
+        self.screen_top = self
+            .screen_top
+            .min(HISTORY_ROWS.saturating_sub(viewport_rows));
+        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top as i32);
     }
 
     fn index(&self, y: u32, x: u32) -> usize {
@@ -315,24 +350,44 @@ impl TerminalModel {
 
     fn set(&mut self, y: u32, x: u32, cell: Cell) {
         let idx = self.index(y, x);
-        self.cells[idx] = cell;
-    }
-
-    fn clear_cell(&mut self, y: u32, x: u32) {
-        self.set(y, x, Cell::default());
-    }
-
-    fn clear_row(&mut self, y: u32) {
-        for x in 0..self.cols {
-            self.clear_cell(y, x);
+        if self.cells[idx].ch != cell.ch || self.cells[idx].style != cell.style {
+            self.cells[idx] = cell;
+            let physical_row = (self.row_start + y as usize) % HISTORY_ROWS as usize;
+            self.dirty_rows[physical_row] = true;
         }
     }
 
     fn clear_all(&mut self) {
-        self.cells.fill(Cell::default());
+        let style = self.clear_style();
+        self.cells.fill(Cell { ch: ' ', style });
+        self.dirty_rows.fill(true);
+    }
+
+    fn clear_style(&self) -> CellStyle {
+        CellStyle {
+            fg: Rgba::WHITE,
+            bg: self.style.bg,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    fn clear_cell(&mut self, y: u32, x: u32) {
+        let style = self.clear_style();
+        self.set(y, x, Cell { ch: ' ', style });
+    }
+
+    fn clear_row(&mut self, y: u32) {
+        let style = self.clear_style();
+        for x in 0..self.cols {
+            self.set(y, x, Cell { ch: ' ', style });
+        }
+        let physical_row = (self.row_start + y as usize) % HISTORY_ROWS as usize;
+        self.dirty_rows[physical_row] = true;
     }
 
     fn scroll_up_one(&mut self) {
+        tracing::debug!(row_start = self.row_start, "global_scroll_up_one");
         self.row_start = (self.row_start + 1) % HISTORY_ROWS as usize;
         self.clear_row(HISTORY_ROWS - 1);
         self.cursor.y = HISTORY_ROWS - 1;
@@ -342,12 +397,22 @@ impl TerminalModel {
         while self.cursor.y >= HISTORY_ROWS {
             self.scroll_up_one();
         }
+
+        if self.cursor.y < self.screen_top {
+            self.screen_top = self.cursor.y;
+        } else if self.cursor.y >= self.screen_top + self.viewport_rows {
+            if self.is_alt_buffer {
+                // In alt buffer, we DON'T grow screen_top.
+                // We should have scrolled instead.
+                self.cursor.y = self.screen_top + self.viewport_rows - 1;
+            } else {
+                self.screen_top = self.cursor.y - (self.viewport_rows - 1);
+            }
+        }
     }
 
     fn screen_top(&self) -> u32 {
-        self.cursor
-            .y
-            .saturating_sub(self.viewport_rows.saturating_sub(1))
+        self.screen_top
     }
 
     fn current_screen_top(&self) -> u32 {
@@ -355,7 +420,7 @@ impl TerminalModel {
     }
 
     fn current_view_top(&self) -> u32 {
-        let screen_top = self.screen_top() as i32;
+        let screen_top = self.screen_top as i32;
         (screen_top - self.scroll_offset).max(0) as u32
     }
 
@@ -366,6 +431,7 @@ impl TerminalModel {
         on_image: &mut dyn FnMut(CompactString),
     ) {
         let current_screen_top = self.current_screen_top();
+        tracing::debug!(?event, "vte_event");
         match event {
             VteEvent::Echo(character) => {
                 if character == '\t' {
@@ -461,7 +527,8 @@ impl TerminalModel {
                 self.clear_row(self.cursor.y);
             }
             VteEvent::ClearUp => {
-                for y in 0..self.cursor.y {
+                let st = self.current_screen_top();
+                for y in st..self.cursor.y {
                     self.clear_row(y);
                 }
                 for x in 0..self.cursor.x {
@@ -469,10 +536,12 @@ impl TerminalModel {
                 }
             }
             VteEvent::ClearDown => {
+                let st = self.current_screen_top();
+                let bottom = (st + self.viewport_rows).min(HISTORY_ROWS);
                 for x in self.cursor.x..self.cols {
                     self.clear_cell(self.cursor.y, x);
                 }
-                for y in (self.cursor.y + 1)..HISTORY_ROWS {
+                for y in (self.cursor.y + 1)..bottom {
                     self.clear_row(y);
                 }
             }
@@ -499,26 +568,80 @@ impl TerminalModel {
                 }
             },
             VteEvent::EnableAlternativeBuffer => {
+                self.is_alt_buffer = true;
                 self.clear_all();
-                self.cursor = CursorPos {
-                    x: 0,
-                    y: current_screen_top,
-                };
+                self.cursor_hidden = false;
+                self.screen_top = 0;
+                self.cursor = CursorPos { x: 0, y: 0 };
             }
             VteEvent::DisableAlternativeBuffer => {
+                self.is_alt_buffer = false;
                 self.clear_all();
-                self.cursor = CursorPos {
-                    x: 0,
-                    y: current_screen_top,
-                };
+                self.cursor_hidden = false;
+                self.screen_top = 0;
+                self.cursor = CursorPos { x: 0, y: 0 };
             }
             VteEvent::EnableFocusReporting => self.focus_reporting = true,
             VteEvent::DisableFocusReporting => self.focus_reporting = false,
+            VteEvent::ShowCursor => self.cursor_hidden = false,
+            VteEvent::HideCursor => self.cursor_hidden = true,
+            VteEvent::InsertLine(n) => self.insert_line(n),
+            VteEvent::DeleteLine(n) => self.delete_line(n),
+            VteEvent::InsertCharacter(n) => self.insert_character(n),
+            VteEvent::DeleteCharacter(n) => self.delete_character(n),
+            VteEvent::EraseCharacter(n) => self.erase_character(n),
+            VteEvent::FullReset => {
+                self.clear_all();
+                self.style = CellStyle::default();
+                self.cursor_hidden = false;
+                self.cursor = CursorPos { x: 0, y: 0 };
+                self.screen_top = 0;
+            }
+            VteEvent::SetMargin { top, bottom } => {
+                let st = self.current_screen_top();
+                let top_val = top.unwrap_or(0);
+                let bottom_val = bottom.unwrap_or(0);
+
+                let t = if top_val == 0 { 1 } else { top_val }.saturating_sub(1);
+                let b = if bottom_val == 0 {
+                    self.viewport_rows
+                } else {
+                    bottom_val
+                }
+                .saturating_sub(1);
+                let b = b.min(self.viewport_rows.saturating_sub(1));
+
+                if t < b {
+                    self.margin_top = Some(t);
+                    self.margin_bottom = Some(b);
+                } else {
+                    self.margin_top = None;
+                    self.margin_bottom = None;
+                }
+                self.cursor.x = 0;
+                self.cursor.y = st + self.margin_top.unwrap_or(0);
+            }
+            VteEvent::Index => self.move_down(1),
+            VteEvent::ReverseIndex => {
+                let screen_top = self.current_screen_top();
+                let cy_rel = self.cursor.y.saturating_sub(screen_top);
+                let mt = self.margin_top.unwrap_or(0);
+                if cy_rel == mt {
+                    let mb = self.margin_bottom.unwrap_or(self.viewport_rows - 1);
+                    self.scroll_region_down(1, mt as usize, mb as usize);
+                } else {
+                    self.cursor.y = self.cursor.y.saturating_sub(1);
+                }
+            }
+            VteEvent::NextLine => {
+                self.cursor.x = 0;
+                self.move_down(1);
+            }
             _ => {}
         }
 
         self.ensure_cursor_visible();
-        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top() as i32);
+        self.scroll_offset = self.scroll_offset.clamp(0, self.screen_top as i32);
     }
 
     fn move_up(&mut self, rows: u32) {
@@ -526,8 +649,71 @@ impl TerminalModel {
     }
 
     fn move_down(&mut self, rows: u32) {
-        self.cursor.y = self.cursor.y.saturating_add(rows.max(1));
+        let rows = rows.max(1);
+        let screen_top = self.current_screen_top();
+        let cy_rel = self.cursor.y.saturating_sub(screen_top);
+
+        let mt = self.margin_top.unwrap_or(0);
+        let mb = self.margin_bottom.unwrap_or(self.viewport_rows - 1);
+
+        if cy_rel == mb {
+            // Scroll region up by rows instead of pushing cursor down
+            self.scroll_region_up(rows as usize, mt as usize, mb as usize);
+            return;
+        } else if cy_rel >= mt && cy_rel < mb && cy_rel + rows >= mb {
+            let to_move = mb - cy_rel;
+            let to_scroll = rows - to_move;
+            self.cursor.y += to_move;
+            if to_scroll > 0 {
+                self.scroll_region_up(to_scroll as usize, mt as usize, mb as usize);
+            }
+            return;
+        }
+
+        self.cursor.y = self.cursor.y.saturating_add(rows);
         self.ensure_cursor_visible();
+    }
+
+    fn scroll_region_up(&mut self, n: usize, mt: usize, mb: usize) {
+        tracing::debug!(n, mt, mb, "scroll_region_up");
+        let screen_top = self.current_screen_top() as usize;
+        let start_y = screen_top + mt;
+        let end_y = screen_top + mb + 1;
+        for y in start_y..end_y {
+            let src_y = y + n;
+            if src_y < end_y {
+                for x in 0..self.cols {
+                    let cell = self.get(src_y as u32, x);
+                    self.set(y as u32, x, cell);
+                }
+            } else {
+                self.clear_row(y as u32);
+            }
+            // Force dirty even if cell content didn't change —
+            // the row has shifted position and its cached geometry is stale
+            let physical = (self.row_start + y) % HISTORY_ROWS as usize;
+            self.dirty_rows[physical] = true;
+        }
+    }
+
+    fn scroll_region_down(&mut self, n: usize, mt: usize, mb: usize) {
+        let screen_top = self.current_screen_top() as usize;
+        let start_y = screen_top + mt;
+        let end_y = screen_top + mb + 1;
+
+        for y in (start_y..end_y).rev() {
+            if y >= start_y + n {
+                let src_y = y - n;
+                for x in 0..self.cols {
+                    let cell = self.get(src_y as u32, x);
+                    self.set(y as u32, x, cell);
+                }
+            } else {
+                self.clear_row(y as u32);
+            }
+            let physical = (self.row_start + y) % HISTORY_ROWS as usize;
+            self.dirty_rows[physical] = true;
+        }
     }
 
     fn move_right(&mut self, cols: u32) {
@@ -536,6 +722,107 @@ impl TerminalModel {
             self.cursor.y = self.cursor.y.saturating_add(self.cursor.x / self.cols);
             self.cursor.x %= self.cols;
             self.ensure_cursor_visible();
+        }
+    }
+
+    fn insert_line(&mut self, n: u32) {
+        let n = n.max(1) as usize;
+        let screen_top = self.current_screen_top() as usize;
+        let current_y = self.cursor.y as usize;
+
+        let mt = self.margin_top.unwrap_or(0) as usize;
+        let mb = self.margin_bottom.unwrap_or(self.viewport_rows - 1) as usize;
+
+        let start_y = screen_top + mt;
+        let limit_y = screen_top + mb + 1;
+
+        if current_y < start_y || current_y >= limit_y {
+            return;
+        }
+
+        for y in (current_y..limit_y).rev() {
+            let target_y = y + n;
+            if target_y < limit_y {
+                for x in 0..self.cols {
+                    let cell = self.get(y as u32, x);
+                    self.set(target_y as u32, x, cell);
+                }
+                let phys = (self.row_start + target_y) % HISTORY_ROWS as usize;
+                self.dirty_rows[phys] = true;
+            }
+            if y < current_y + n {
+                self.clear_row(y as u32);
+            }
+            let phys = (self.row_start + y) % HISTORY_ROWS as usize;
+            self.dirty_rows[phys] = true;
+        }
+    }
+
+    fn delete_line(&mut self, n: u32) {
+        let n = n.max(1) as usize;
+        let screen_top = self.current_screen_top() as usize;
+        let current_y = self.cursor.y as usize;
+
+        let mt = self.margin_top.unwrap_or(0) as usize;
+        let mb = self.margin_bottom.unwrap_or(self.viewport_rows - 1) as usize;
+
+        let start_y = screen_top + mt;
+        let limit_y = screen_top + mb + 1;
+
+        if current_y < start_y || current_y >= limit_y {
+            return;
+        }
+
+        for y in current_y..limit_y {
+            let src_y = y + n;
+            if src_y < limit_y {
+                for x in 0..self.cols {
+                    let cell = self.get(src_y as u32, x);
+                    self.set(y as u32, x, cell);
+                }
+            } else {
+                self.clear_row(y as u32);
+            }
+            let phys = (self.row_start + y) % HISTORY_ROWS as usize;
+            self.dirty_rows[phys] = true;
+        }
+    }
+
+    fn insert_character(&mut self, n: u32) {
+        let n = n.max(1) as usize;
+        let y = self.cursor.y;
+        let x = self.cursor.x as usize;
+        for col in (x..self.cols as usize).rev() {
+            let target_col = col + n;
+            if target_col < self.cols as usize {
+                let cell = self.get(y, col as u32);
+                self.set(y, target_col as u32, cell);
+            }
+        }
+        for col in x..(x + n).min(self.cols as usize) {
+            self.clear_cell(y, col as u32);
+        }
+    }
+
+    fn delete_character(&mut self, n: u32) {
+        let n = n.max(1) as usize;
+        let y = self.cursor.y;
+        let x = self.cursor.x as usize;
+        for col in x..self.cols as usize {
+            let src_col = col + n;
+            if src_col < self.cols as usize {
+                let cell = self.get(y, src_col as u32);
+                self.set(y, col as u32, cell);
+            } else {
+                self.clear_cell(y, col as u32);
+            }
+        }
+    }
+
+    fn erase_character(&mut self, n: u32) {
+        let n = n.max(1);
+        for x in self.cursor.x..(self.cursor.x + n).min(self.cols) {
+            self.clear_cell(self.cursor.y, x);
         }
     }
 }
@@ -882,16 +1169,22 @@ struct WindowState {
     cursor: AnimatedCursor,
     content_dirty: bool,
     cached_cursor_x_px: f32,
+    row_cache: Vec<RowCache>,
 
     terminal: TerminalModel,
     terminal_pty: PseudoTerminal,
     reader: Receiver<VteEvent>,
     writer: Sender<Vec<u8>>,
 
-    explosion: Option<ExplosionEffect>,
     last_mouse_pos: (u32, u32),
     modifiers: ModifiersState,
     is_mouse_down: bool,
+    face: ttf_parser::Face<'static>,
+
+    config: Config,
+    bloom_renderer: BloomRenderer,
+    main_scene_texture: Option<wgpu::Texture>,
+    main_scene_view: Option<wgpu::TextureView>,
 }
 
 impl WindowState {
@@ -902,33 +1195,39 @@ impl WindowState {
     ) -> io::Result<Self> {
         let size = window.surface_size();
         let scale_factor = window.scale_factor();
-        let grid = grid_from_pixels(size.width, size.height, scale_factor);
 
-        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::all();
+        let instance = Instance::new(instance_descriptor);
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| io::Error::other(format!("create_surface failed: {e}")))?;
+
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
+                compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await
             .map_err(|e| io::Error::other(format!("request_adapter failed: {e}")))?;
 
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default())
+            .request_device(&DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| io::Error::other(format!("request_device failed: {e}")))?;
-
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(|e| io::Error::other(format!("create_surface failed: {e}")))?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(TextureFormat::is_srgb)
+            .find(|f| matches!(f, TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm))
+            .or_else(|| caps.formats.iter().copied().find(|f| f.is_srgb()))
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| io::Error::other("no surface format available"))?;
         let present_mode = PresentMode::AutoVsync;
@@ -943,18 +1242,31 @@ impl WindowState {
             caps.alpha_modes[0]
         };
 
-        let surface_config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode,
-            alpha_mode,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+        let limits = device.limits();
+        let width = size.width.clamp(1, limits.max_texture_dimension_2d);
+        let height = size.height.clamp(1, limits.max_texture_dimension_2d);
+        let grid = grid_from_pixels(width, height, scale_factor);
+
+        let config = Config::load();
+        let surface_config = {
+            let mut surface_config = SurfaceConfiguration {
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width,
+                height,
+                present_mode,
+                alpha_mode,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+            };
+
+            if config.transparency.enabled {
+                surface_config.alpha_mode = CompositeAlphaMode::PostMultiplied;
+            }
+            surface_config
         };
+
         surface.configure(&device, &surface_config);
-        static FONT_DATA: &[u8] = include_bytes!("../assets/fonts/FiraCode.ttc");
         let font_atlas = generate_atlas(&device, &queue, FONT_DATA);
         let text_renderer = SDFTextRenderer::new(&device, format);
         let bg_renderer = BackgroundRenderer::new(&device, format);
@@ -963,6 +1275,43 @@ impl WindowState {
         let mut terminal_pty = PseudoTerminal::new(grid)?;
         let mut command = shell::default();
         terminal_pty.spawn(&mut command)?;
+
+        let bloom_renderer = BloomRenderer::new(&device, format);
+
+        let (main_scene_texture, main_scene_view) = if config.bloom.enabled {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Main Scene Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (Some(tex), Some(view))
+        } else {
+            (None, None)
+        };
+
+        #[cfg(target_os = "macos")]
+        if config.transparency.enabled {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = window.window_handle()
+                && let RawWindowHandle::AppKit(appkit) = handle.as_raw()
+            {
+                let ptr = appkit.ns_view.as_ptr();
+                unsafe {
+                    macos_transparency::make_window_transparent(ptr);
+                }
+            }
+        }
 
         let (reader_tx, reader_rx) = crossbeam_channel::unbounded::<VteEvent>();
         let mut pty_reader = terminal_pty.reader()?;
@@ -1002,6 +1351,9 @@ impl WindowState {
             }
         });
 
+        let face = ttf_parser::Face::parse(FONT_DATA, 4)
+            .unwrap_or_else(|_| ttf_parser::Face::parse(FONT_DATA, 0).unwrap());
+
         Ok(Self {
             window,
             device,
@@ -1021,10 +1373,15 @@ impl WindowState {
             terminal_pty,
             reader: reader_rx,
             writer: writer_tx,
-            explosion: None,
             last_mouse_pos: (0, 0),
             modifiers: ModifiersState::default(),
             is_mouse_down: false,
+            face,
+            row_cache: (0..HISTORY_ROWS).map(|_| RowCache::default()).collect(),
+            config,
+            bloom_renderer,
+            main_scene_texture,
+            main_scene_view,
         })
     }
 
@@ -1032,6 +1389,10 @@ impl WindowState {
         if width == 0 || height == 0 {
             return;
         }
+
+        let limits = self.device.limits();
+        let width = width.clamp(1, limits.max_texture_dimension_2d);
+        let height = height.clamp(1, limits.max_texture_dimension_2d);
 
         self.surface_config.width = width;
         self.surface_config.height = height;
@@ -1043,6 +1404,27 @@ impl WindowState {
         self.terminal.resize(grid.cols, grid.rows);
         if let Err(e) = self.terminal_pty.resize(grid) {
             eprintln!("Failed to resize PTY: {}", e);
+        }
+
+        if self.config.bloom.enabled {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Main Scene Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            self.main_scene_texture = Some(tex);
+            self.main_scene_view = Some(view);
         }
 
         self.content_dirty = true;
@@ -1233,6 +1615,9 @@ impl WindowState {
             });
         }
         self.cursor.set_target(self.terminal.cursor);
+        if self.terminal.cursor_hidden {
+            self.cursor.snap();
+        }
         changed
     }
 
@@ -1241,98 +1626,139 @@ impl WindowState {
             self.content_dirty = true;
         }
 
-        let view_top = self.terminal.current_view_top();
-        let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
+        if self.content_dirty {
+            let row_start = self.terminal.row_start;
+            let screen_top = self.terminal.screen_top;
+            tracing::debug!(row_start, screen_top, "content_dirty redraw trigger");
+        }
 
         let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
+        let view_top = self.terminal.current_view_top() as usize;
+        let view_rows = self.terminal.viewport_rows as usize;
 
         if self.content_dirty {
-            let mut row_spans = Vec::with_capacity(view_rows as usize);
-            let mut row_texts = Vec::with_capacity(view_rows as usize);
-            let mut bg_vertices = Vec::new();
+            let row_start = self.terminal.row_start;
+            let (sw, sh) = (
+                self.surface_config.width as f32,
+                self.surface_config.height as f32,
+            );
 
-            for row in 0..view_rows {
-                let y = view_top + row;
-                row_spans.push(self.row_spans(y));
-                let mut text = String::with_capacity(self.terminal.cols as usize);
-                for col in 0..self.terminal.cols {
-                    let cell = self.terminal.get(y, col);
-                    let mut drawn_custom = false;
-
-                    if let Some(bg) = cell.style.bg {
-                        append_bg_quad(
-                            &mut bg_vertices,
-                            self.surface_config.width as f32,
-                            self.surface_config.height as f32,
-                            col as f32 * cell_width,
-                            row as f32 * cell_height,
-                            cell_width,
-                            cell_height,
-                            bg,
-                        );
-                    }
-
-                    if is_custom_block(cell.ch) {
-                        let fg = Rgba {
-                            r: cell.style.fg.r,
-                            g: cell.style.fg.g,
-                            b: cell.style.fg.b,
-                            a: cell.style.fg.a,
-                        };
-                        drawn_custom = append_custom_block(
-                            &mut bg_vertices,
-                            self.surface_config.width as f32,
-                            self.surface_config.height as f32,
-                            col as f32 * cell_width,
-                            row as f32 * cell_height,
-                            cell_width,
-                            cell_height,
-                            cell.ch,
-                            fg,
-                        );
-                    }
-
-                    text.push(if drawn_custom { ' ' } else { cell.ch });
+            let mut dirty_rows_to_generate = Vec::new();
+            for row_idx in 0..view_rows {
+                let y = view_top + row_idx;
+                let physical_row = (y + row_start) % HISTORY_ROWS as usize;
+                if self.terminal.dirty_rows[physical_row] {
+                    dirty_rows_to_generate.push(physical_row);
+                    self.terminal.dirty_rows[physical_row] = false;
                 }
-                row_texts.push(text);
             }
 
-            let face = ttf_parser::Face::parse(FONT_DATA, 4)
-                .unwrap_or_else(|_| ttf_parser::Face::parse(FONT_DATA, 0).unwrap());
+            if !dirty_rows_to_generate.is_empty() {
+                let font_atlas = &self.font_atlas;
+                let face = &self.face;
+                let lut = get_linear_lut();
+                let cols = self.terminal.cols;
+
+                let new_caches: Vec<(usize, RowCache)> = dirty_rows_to_generate
+                    .into_par_iter()
+                    .map(|physical_row| {
+                        let mut cache = RowCache::default();
+                        let row_data = &self.terminal.cells
+                            [physical_row * cols as usize..(physical_row + 1) * cols as usize];
+
+                        // Vertical position in cache is always 0.0 (relative to row)
+                        let y_px = 0.0;
+
+                        for col in 0..cols {
+                            let cell = &row_data[col as usize];
+                            let x = col as f32 * cell_width;
+                            let mut ch = cell.ch;
+
+                            if let Some(bg) = cell.style.bg {
+                                append_bg_quad(
+                                    &mut cache.bg,
+                                    sw,
+                                    sh,
+                                    x,
+                                    y_px,
+                                    cell_width,
+                                    cell_height,
+                                    bg,
+                                    lut,
+                                );
+                            }
+
+                            if is_custom_block(ch)
+                                && append_custom_block(
+                                    &mut cache.bg,
+                                    sw,
+                                    sh,
+                                    x,
+                                    y_px,
+                                    cell_width,
+                                    cell_height,
+                                    ch,
+                                    cell.style.fg,
+                                    lut,
+                                )
+                            {
+                                ch = ' ';
+                            }
+
+                            if ch != ' ' {
+                                let fg = cell.style.fg;
+                                let color = [
+                                    lut[fg.r as usize],
+                                    lut[fg.g as usize],
+                                    lut[fg.b as usize],
+                                    fg.a as f32 / 255.0,
+                                ];
+                                SDFTextRenderer::layout_char(
+                                    font_atlas,
+                                    face,
+                                    ch,
+                                    x,
+                                    y_px,
+                                    cell_width,
+                                    cell_height,
+                                    font_size,
+                                    sw,
+                                    sh,
+                                    color,
+                                    &mut cache.text,
+                                );
+                            }
+                        }
+                        (physical_row, cache)
+                    })
+                    .collect();
+
+                for (idx, cache) in new_caches {
+                    self.row_cache[idx] = cache;
+                }
+            }
+
+            let mut bg_vertices = Vec::new();
             let mut text_vertices = Vec::new();
 
-            for (row, spans) in row_spans.iter().enumerate() {
-                let mut x = 0.0;
-                let y = row as f32 * cell_height;
-                for (text, fg) in spans {
-                    let to_linear = |c: u8| (c as f32 / 255.0).powf(2.2);
-                    let color = [
-                        to_linear(fg.r),
-                        to_linear(fg.g),
-                        to_linear(fg.b),
-                        fg.a as f32 / 255.0,
-                    ];
-                    SDFTextRenderer::layout_text(
-                        &self.font_atlas,
-                        &face,
-                        text,
-                        x,
-                        y,
-                        cell_width,
-                        cell_height,
-                        font_size,
-                        self.surface_config.width as f32,
-                        self.surface_config.height as f32,
-                        color,
-                        &mut text_vertices,
-                    );
-                    for _c in text.chars() {
-                        x += cell_width;
-                    }
+            for row_idx in 0..view_rows {
+                let y = view_top + row_idx;
+                let physical_row = (y + row_start) % HISTORY_ROWS as usize;
+
+                // Calculate position relative to viewport top
+                let py_offset_ndc = (row_idx as f32 * cell_height / sh) * 2.0;
+
+                for v in &self.row_cache[physical_row].bg {
+                    let mut v = *v;
+                    v.pos[1] -= py_offset_ndc;
+                    bg_vertices.push(v);
+                }
+                for v in &self.row_cache[physical_row].text {
+                    let mut v = *v;
+                    v.pos[1] -= py_offset_ndc;
+                    text_vertices.push(v);
                 }
             }
-
-            self.cached_cursor_x_px = self.terminal.cursor.x as f32 * cell_width;
 
             self.bg_renderer
                 .prepare(&self.device, &self.queue, &bg_vertices);
@@ -1342,33 +1768,37 @@ impl WindowState {
         }
 
         let frame = match self.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(frame) | CurrentSurfaceTexture::Suboptimal(frame) => {
-                frame
-            }
+            CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => f,
             CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return;
             }
-            CurrentSurfaceTexture::Timeout
-            | CurrentSurfaceTexture::Occluded
-            | CurrentSurfaceTexture::Validation => return,
+            _ => return,
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&CommandEncoderDescriptor {
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("terminal-encoder"),
             });
+
+        let scene_view = if self.config.bloom.enabled {
+            self.main_scene_view.as_ref().unwrap()
+        } else {
+            &view
+        };
+
+        let clear_color = wgpu::Color::TRANSPARENT;
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("terminal-pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
+                    view: scene_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        load: LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1412,6 +1842,13 @@ impl WindowState {
 
                 let w = width - inset * 0.5;
                 let h = cell_height - inset * 0.25;
+                // Cursor color is always white, so we can use a fixed LUT value or direct conversion
+                let lut = get_linear_lut();
+                let alpha_base = *alpha as f32 / 255.0;
+                let now = self.cursor.last_tick.elapsed().as_secs_f32();
+                let pulse = (now * 4.0).sin() * 0.2 + 0.8;
+                let final_alpha = (alpha_base * pulse).clamp(0.0, 1.0);
+
                 append_bg_quad(
                     &mut cursor_vertices,
                     self.surface_config.width as f32,
@@ -1421,17 +1858,38 @@ impl WindowState {
                     w,
                     h,
                     Rgba {
-                        r: 255,
+                        r: 0,
                         g: 255,
                         b: 255,
-                        a: *alpha,
+                        a: (final_alpha * 255.0) as u8,
                     },
+                    lut,
                 );
             }
 
             self.cursor_renderer
                 .prepare(&self.device, &self.queue, &cursor_vertices);
-            self.cursor_renderer.render(&mut pass);
+            if !self.terminal.cursor_hidden {
+                self.cursor_renderer.render(&mut pass);
+            }
+        }
+
+        if self.config.bloom.enabled {
+            self.bloom_renderer.render(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                self.main_scene_view.as_ref().unwrap(),
+                &view,
+                self.surface_config.width,
+                self.surface_config.height,
+                &self.config.bloom,
+                if self.config.transparency.enabled {
+                    self.config.transparency.opacity
+                } else {
+                    1.0
+                },
+            );
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1439,290 +1897,6 @@ impl WindowState {
         if self.cursor.update() {
             self.window.request_redraw();
         }
-    }
-
-    fn capture_frame_and_start_explosion(&mut self) {
-        let width = self.surface_config.width.max(1);
-        let height = self.surface_config.height.max(1);
-
-        let capture_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("explosion-capture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.surface_config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        self.content_dirty = true;
-        self.pump_terminal();
-
-        let view_top = self.terminal.current_view_top();
-        let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
-
-        let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
-
-        {
-            let mut row_spans = Vec::with_capacity(view_rows as usize);
-            let mut row_texts = Vec::with_capacity(view_rows as usize);
-            let mut bg_vertices = Vec::new();
-
-            for row in 0..view_rows {
-                let y = view_top + row;
-                row_spans.push(self.row_spans(y));
-                let mut text = String::with_capacity(self.terminal.cols as usize);
-                for col in 0..self.terminal.cols {
-                    let cell = self.terminal.get(y, col);
-                    let mut drawn_custom = false;
-
-                    if let Some(bg) = cell.style.bg {
-                        append_bg_quad(
-                            &mut bg_vertices,
-                            self.surface_config.width as f32,
-                            self.surface_config.height as f32,
-                            col as f32 * cell_width,
-                            row as f32 * cell_height,
-                            cell_width,
-                            cell_height,
-                            bg,
-                        );
-                    }
-
-                    if is_custom_block(cell.ch) {
-                        let fg = Rgba {
-                            r: cell.style.fg.r,
-                            g: cell.style.fg.g,
-                            b: cell.style.fg.b,
-                            a: cell.style.fg.a,
-                        };
-                        drawn_custom = append_custom_block(
-                            &mut bg_vertices,
-                            self.surface_config.width as f32,
-                            self.surface_config.height as f32,
-                            col as f32 * cell_width,
-                            row as f32 * cell_height,
-                            cell_width,
-                            cell_height,
-                            cell.ch,
-                            fg,
-                        );
-                    }
-
-                    text.push(if drawn_custom { ' ' } else { cell.ch });
-                }
-                row_texts.push(text);
-            }
-
-            let face = ttf_parser::Face::parse(FONT_DATA, 4)
-                .unwrap_or_else(|_| ttf_parser::Face::parse(FONT_DATA, 0).unwrap());
-            let mut text_vertices = Vec::new();
-
-            for (row, spans) in row_spans.iter().enumerate() {
-                let mut x = 0.0;
-                let y = row as f32 * cell_height;
-                for (text, fg) in spans {
-                    let to_linear = |c: u8| (c as f32 / 255.0).powf(2.2);
-                    let color = [
-                        to_linear(fg.r),
-                        to_linear(fg.g),
-                        to_linear(fg.b),
-                        fg.a as f32 / 255.0,
-                    ];
-                    SDFTextRenderer::layout_text(
-                        &self.font_atlas,
-                        &face,
-                        text,
-                        x,
-                        y,
-                        cell_width,
-                        cell_height,
-                        font_size,
-                        self.surface_config.width as f32,
-                        self.surface_config.height as f32,
-                        color,
-                        &mut text_vertices,
-                    );
-                    for _c in text.chars() {
-                        x += cell_width;
-                    }
-                }
-            }
-
-            self.bg_renderer
-                .prepare(&self.device, &self.queue, &bg_vertices);
-            self.text_renderer
-                .prepare(&self.device, &self.queue, &text_vertices);
-        }
-
-        let capture_view = capture_texture.create_view(&TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("explosion-capture-encoder"),
-            });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("explosion-capture-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &capture_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.bg_renderer.render(&mut pass);
-            self.text_renderer.render(&self.font_atlas, &mut pass);
-            for image in &self.images {
-                image.render(&mut pass);
-            }
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-
-        let win_pos = self.window.outer_position().unwrap_or_default();
-        let win_surface = self.window.surface_size();
-        let win_outer = self.window.outer_size();
-        let titlebar_h = win_outer.height.saturating_sub(win_surface.height);
-        let content_x = win_pos.x as f32;
-        let content_y = (win_pos.y as u32 + titlebar_h) as f32;
-        let ww = win_surface.width as f32;
-        let wh = win_surface.height as f32;
-
-        let (sw, sh, mx, my) = if let Some(mon) = self.window.current_monitor() {
-            let vm = mon.current_video_mode();
-            let ms = vm.as_ref().map(|v| v.size()).unwrap_or(win_surface);
-            let mp = mon.position().unwrap_or_default();
-            (ms.width as f32, ms.height as f32, mp.x as f32, mp.y as f32)
-        } else {
-            (ww, wh, content_x, content_y)
-        };
-
-        let wx = content_x - mx;
-        let wy = content_y - my;
-        let scale_x = ww / sw;
-        let scale_y = wh / sh;
-        let offset_x = (2.0 * wx + ww) / sw - 1.0;
-        let offset_y = 1.0 - (2.0 * wy + wh) / sh;
-
-        self.window.set_decorations(false);
-        self.window
-            .set_outer_position(winit::dpi::Position::Physical(PhysicalPosition::new(
-                mx as i32, my as i32,
-            )));
-        let _ = self
-            .window
-            .request_surface_size(PhysicalSize::new(sw as u32, sh as u32).into());
-        self.surface_config.width = sw as u32;
-        self.surface_config.height = sh as u32;
-
-        self.surface_config.alpha_mode = CompositeAlphaMode::PostMultiplied;
-
-        #[cfg(target_os = "macos")]
-        let ns_view_ptr = {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(handle) = self.window.window_handle() {
-                if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
-                    let ptr = appkit.ns_view.as_ptr();
-                    unsafe {
-                        macos_transparency::make_window_transparent(ptr);
-                    }
-                    Some(ptr)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        self.surface.configure(&self.device, &self.surface_config);
-
-        #[cfg(target_os = "macos")]
-        if let Some(ptr) = ns_view_ptr {
-            unsafe {
-                macos_transparency::make_window_transparent(ptr);
-            }
-        }
-
-        self.explosion = Some(ExplosionEffect::new(
-            &self.device,
-            self.surface_config.format,
-            capture_texture,
-            scale_x,
-            scale_y,
-            offset_x,
-            offset_y,
-            sw,
-            sh,
-        ));
-    }
-
-    fn explosion_redraw(&mut self) {
-        let explosion = self.explosion.as_mut().unwrap();
-        explosion.update();
-        explosion.prepare(&self.device, &self.queue);
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return,
-        };
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("explosion-encoder"),
-            });
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("explosion-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            explosion.render(&mut pass);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
     }
 
     fn row_spans(&self, y: u32) -> Vec<(String, Rgba)> {
@@ -1758,7 +1932,6 @@ struct App {
     state: Option<WindowState>,
     proxy: EventLoopProxy,
     redraw_pending: Arc<AtomicBool>,
-    exploding: bool,
 }
 
 impl ApplicationHandler for App {
@@ -1809,20 +1982,18 @@ impl ApplicationHandler for App {
         };
 
         match event {
-            WindowEvent::CloseRequested if !self.exploding => {
-                self.exploding = true;
-                state.capture_frame_and_start_explosion();
-                state.window.request_redraw();
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
             }
-            WindowEvent::SurfaceResized(size) if !self.exploding => {
+            WindowEvent::SurfaceResized(size) => {
                 state.resize(size.width, size.height);
                 state.window.request_redraw();
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.exploding => {
+            WindowEvent::MouseWheel { delta, .. } => {
                 state.handle_mouse_wheel(delta);
                 state.window.request_redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } if !self.exploding => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 state.handle_keyboard(&event);
                 state.window.request_redraw();
             }
@@ -1832,32 +2003,19 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(focused) => {
                 state.handle_focus(focused);
             }
-            WindowEvent::PointerMoved { position, .. } if !self.exploding => {
+            WindowEvent::PointerMoved { position, .. } => {
                 state.handle_cursor_moved(position);
             }
             WindowEvent::PointerButton {
                 state: btn_state,
-                button,
+                button: winit::event::ButtonSource::Mouse(mouse_btn),
                 position,
                 ..
             } => {
-                if !self.exploding
-                    && let winit::event::ButtonSource::Mouse(mouse_btn) = button
-                {
-                    state.handle_mouse_input(btn_state, mouse_btn, position);
-                }
+                state.handle_mouse_input(btn_state, mouse_btn, position);
             }
             WindowEvent::RedrawRequested => {
-                if self.exploding {
-                    state.explosion_redraw();
-                    if state.explosion.as_ref().is_some_and(|e| e.finished) {
-                        event_loop.exit();
-                    } else {
-                        state.window.request_redraw();
-                    }
-                } else {
-                    state.redraw();
-                }
+                state.redraw();
                 self.redraw_pending.store(false, Ordering::Release);
             }
             _ => {}
@@ -1866,13 +2024,15 @@ impl ApplicationHandler for App {
 }
 
 pub fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let event_loop = EventLoop::new().expect("create event loop");
     let proxy = event_loop.create_proxy();
     let app = App {
         state: None,
         proxy,
         redraw_pending: Arc::new(AtomicBool::new(false)),
-        exploding: false,
     };
     event_loop.run_app(app).expect("run app");
 }
@@ -1932,15 +2092,16 @@ pub fn is_custom_block(ch: char) -> bool {
 }
 
 fn append_custom_block(
-    vertices: &mut Vec<BgVertex>,
-    surface_width: f32,
-    surface_height: f32,
-    base_x: f32,
-    base_y: f32,
+    out: &mut Vec<BgVertex>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
     cell_width: f32,
     cell_height: f32,
     ch: char,
-    fg: Rgba,
+    color: Rgba,
+    lut: &[f32; 256],
 ) -> bool {
     let u = ch as u32;
     // Braille: 0x2800..=0x28FF
@@ -1953,14 +2114,15 @@ fn append_custom_block(
 
         let mut add_dot = |dx: f32, dy: f32| {
             append_bg_quad(
-                vertices,
-                surface_width,
-                surface_height,
-                base_x + dx * dot_w + margin_x,
-                base_y + dy * dot_h + margin_y,
+                out,
+                width,
+                height,
+                x + dx * dot_w + margin_x,
+                y + dy * dot_h + margin_y,
                 dot_w - margin_x * 2.0,
                 dot_h - margin_y * 2.0,
-                fg,
+                color,
+                lut,
             );
         };
 
@@ -1991,16 +2153,17 @@ fn append_custom_block(
         return true;
     }
 
-    let mut draw = |x: f32, y: f32, w: f32, h: f32| {
+    let mut draw = |x_px: f32, y_px: f32, w_px: f32, h_px: f32| {
         append_bg_quad(
-            vertices,
-            surface_width,
-            surface_height,
-            base_x + x,
-            base_y + y,
-            w,
-            h,
-            fg,
+            out,
+            width,
+            height,
+            x + x_px,
+            y + y_px,
+            w_px,
+            h_px,
+            color,
+            lut,
         );
     };
 
@@ -2093,11 +2256,12 @@ fn append_bg_quad(
     w: f32,
     h: f32,
     color: Rgba,
+    lut: &[f32; 256],
 ) {
     let color = [
-        color.r as f32 / 255.0,
-        color.g as f32 / 255.0,
-        color.b as f32 / 255.0,
+        lut[color.r as usize],
+        lut[color.g as usize],
+        lut[color.b as usize],
         color.a as f32 / 255.0,
     ];
 
@@ -2192,4 +2356,10 @@ fn index_to_color(index: u8) -> Rgba {
             Rgba::rgb(value, value, value)
         }
     }
+}
+
+#[derive(Default, Clone)]
+struct RowCache {
+    text: Vec<TextVertex>,
+    bg: Vec<BgVertex>,
 }
