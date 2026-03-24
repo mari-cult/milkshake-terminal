@@ -5,10 +5,7 @@ use crate::vte::{AnsiColor, Intensity, NamedColor, Position, StandardColor, Vte,
 use bytemuck::{Pod, Zeroable};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
-use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
-};
+mod text;
 use image::GenericImageView;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -16,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
+use text::{FontAtlas, SDFTextRenderer, generate_atlas};
 use wgpu::{
     ColorTargetState, CommandEncoderDescriptor, CompositeAlphaMode, CurrentSurfaceTexture,
     DeviceDescriptor, FragmentState, Instance, InstanceDescriptor, LoadOp, MultisampleState,
@@ -45,6 +43,7 @@ const HISTORY_ROWS: u32 = 1000;
 const CELL_WIDTH: f32 = 9.0;
 const CELL_HEIGHT: f32 = 18.0;
 const FONT_SIZE: f32 = 15.0;
+const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/FiraCode.ttc");
 
 const BG_SHADER: &str = r#"
 struct VertexInput {
@@ -149,15 +148,15 @@ struct Cell {
 
 #[derive(Clone, Debug)]
 struct AnimatedCursor {
-    position: CursorPos,
-    target: CursorPos,
+    position: (f32, f32),
+    target: (f32, f32),
     last_tick: Instant,
     trail: VecDeque<CursorTrailSample>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct CursorTrailSample {
-    position: CursorPos,
+    position: (f32, f32),
     born_at: Instant,
 }
 
@@ -165,16 +164,18 @@ impl AnimatedCursor {
     fn new(position: CursorPos) -> Self {
         let now = Instant::now();
         Self {
-            position,
-            target: position,
+            position: (position.x as f32, position.y as f32),
+            target: (position.x as f32, position.y as f32),
             last_tick: now,
             trail: VecDeque::new(),
         }
     }
 
     fn set_target(&mut self, target: CursorPos) {
-        if self.target != target {
-            self.target = target;
+        let tx = target.x as f32;
+        let ty = target.y as f32;
+        if (self.target.0 - tx).abs() > 0.001 || (self.target.1 - ty).abs() > 0.001 {
+            self.target = (tx, ty);
         }
     }
 
@@ -184,11 +185,12 @@ impl AnimatedCursor {
         self.last_tick = now;
 
         let mut changed = false;
-        let smoothing = 1.0 - (-dt.as_secs_f32() * 18.0).exp();
+        let smoothing = 1.0 - (-dt.as_secs_f32() * 21.0).exp();
 
-        let next_x = lerp_u32(self.position.x, self.target.x, smoothing);
-        let next_y = lerp_u32(self.position.y, self.target.y, smoothing);
-        if next_x != self.position.x || next_y != self.position.y {
+        let dx = self.target.0 - self.position.0;
+        let dy = self.target.1 - self.position.1;
+
+        if dx.abs() > 0.001 || dy.abs() > 0.001 {
             self.trail.push_front(CursorTrailSample {
                 position: self.position,
                 born_at: now,
@@ -196,11 +198,12 @@ impl AnimatedCursor {
             while self.trail.len() > 10 {
                 self.trail.pop_back();
             }
-            self.position = CursorPos {
-                x: next_x,
-                y: next_y,
-            };
+            self.position.0 += dx * smoothing;
+            self.position.1 += dy * smoothing;
             changed = true;
+        } else {
+            // Snap to target if very close
+            self.position = self.target;
         }
 
         while let Some(sample) = self.trail.back() {
@@ -828,13 +831,8 @@ struct WindowState {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: SurfaceConfiguration,
-
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    viewport: Viewport,
-    atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    line_buffers: Vec<Buffer>,
+    font_atlas: FontAtlas,
+    text_renderer: SDFTextRenderer,
     bg_renderer: BackgroundRenderer,
     cursor_renderer: BackgroundRenderer,
     scale_factor: f64,
@@ -915,16 +913,9 @@ impl WindowState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
-
-        let mut font_system = FontSystem::new();
-        load_embedded_fonts(&mut font_system);
-        let swash_cache = SwashCache::new();
-        let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-        let line_buffers = new_line_buffers(&mut font_system, grid.rows, grid.cols, scale_factor);
+        static FONT_DATA: &[u8] = include_bytes!("../assets/fonts/FiraCode.ttc");
+        let font_atlas = generate_atlas(&device, &queue, FONT_DATA);
+        let text_renderer = SDFTextRenderer::new(&device, format);
         let bg_renderer = BackgroundRenderer::new(&device, format);
         let cursor_renderer = BackgroundRenderer::new(&device, format);
 
@@ -976,12 +967,8 @@ impl WindowState {
             queue,
             surface,
             surface_config,
-            font_system,
-            swash_cache,
-            viewport,
-            atlas,
+            font_atlas,
             text_renderer,
-            line_buffers,
             bg_renderer,
             cursor_renderer,
             scale_factor,
@@ -1013,25 +1000,8 @@ impl WindowState {
         if let Err(e) = self.terminal_pty.resize(grid) {
             eprintln!("Failed to resize PTY: {}", e);
         }
-        self.ensure_line_buffers(grid.rows, grid.cols);
-        self.content_dirty = true;
-    }
 
-    fn ensure_line_buffers(&mut self, rows: u32, cols: u32) {
-        let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
-        if self.line_buffers.len() != rows as usize {
-            self.line_buffers =
-                new_line_buffers(&mut self.font_system, rows, cols, self.scale_factor);
-        } else {
-            for buffer in &mut self.line_buffers {
-                buffer.set_size(
-                    &mut self.font_system,
-                    Some(cols as f32 * cell_width),
-                    Some(cell_height),
-                );
-                buffer.set_metrics(&mut self.font_system, Metrics::new(font_size, cell_height));
-            }
-        }
+        self.content_dirty = true;
     }
 
     fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
@@ -1114,18 +1084,10 @@ impl WindowState {
             self.content_dirty = true;
         }
 
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.surface_config.width,
-                height: self.surface_config.height,
-            },
-        );
-
         let view_top = self.terminal.current_view_top();
         let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
-        self.ensure_line_buffers(self.terminal.viewport_rows, self.terminal.cols);
-        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+
+        let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
 
         if self.content_dirty {
             let mut row_spans = Vec::with_capacity(view_rows as usize);
@@ -1178,71 +1140,47 @@ impl WindowState {
                 row_texts.push(text);
             }
 
+            let face = ttf_parser::Face::parse(FONT_DATA, 4)
+                .unwrap_or_else(|_| ttf_parser::Face::parse(FONT_DATA, 0).unwrap());
+            let mut text_vertices = Vec::new();
+
             for (row, spans) in row_spans.iter().enumerate() {
-                let line_buffer = &mut self.line_buffers[row];
-                let default_attrs = Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgba(255, 255, 255, 255));
-                line_buffer.set_rich_text(
-                    &mut self.font_system,
-                    spans
-                        .iter()
-                        .map(|(text, attrs)| (text.as_str(), attrs.clone())),
-                    &default_attrs,
-                    Shaping::Basic,
-                    None,
-                );
-                line_buffer.shape_until_scroll(&mut self.font_system, false);
-            }
-
-            let cursor_row = self.terminal.cursor.y.saturating_sub(view_top) as usize;
-            self.cached_cursor_x_px =
-                if cursor_row < self.line_buffers.len() && cursor_row < row_texts.len() {
-                    cursor_x_from_shaped_line(
-                        &mut self.line_buffers[cursor_row],
-                        &mut self.font_system,
-                        &row_texts[cursor_row],
-                        self.terminal.cursor.x as usize,
+                let mut x = 0.0;
+                let y = row as f32 * cell_height;
+                for (text, fg) in spans {
+                    let to_linear = |c: u8| (c as f32 / 255.0).powf(2.2);
+                    let color = [
+                        to_linear(fg.r),
+                        to_linear(fg.g),
+                        to_linear(fg.b),
+                        fg.a as f32 / 255.0,
+                    ];
+                    SDFTextRenderer::layout_text(
+                        &self.font_atlas,
+                        &face,
+                        text,
+                        x,
+                        y,
                         cell_width,
-                    )
-                } else {
-                    self.terminal.cursor.x as f32 * cell_width
-                };
-
-            let mut text_areas = Vec::with_capacity(view_rows as usize);
-            for (row, line_buffer) in self
-                .line_buffers
-                .iter()
-                .take(view_rows as usize)
-                .enumerate()
-            {
-                text_areas.push(TextArea {
-                    buffer: line_buffer,
-                    left: 0.0,
-                    top: row as f32 * cell_height,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.surface_config.width as i32,
-                        bottom: self.surface_config.height as i32,
-                    },
-                    default_color: Color::rgba(255, 255, 255, 255),
-                    custom_glyphs: &[],
-                });
+                        cell_height,
+                        font_size,
+                        self.surface_config.width as f32,
+                        self.surface_config.height as f32,
+                        color,
+                        &mut text_vertices,
+                    );
+                    for _c in text.chars() {
+                        x += cell_width;
+                    }
+                }
             }
+
+            self.cached_cursor_x_px = self.terminal.cursor.x as f32 * cell_width;
 
             self.bg_renderer
                 .prepare(&self.device, &self.queue, &bg_vertices);
-            let _ = self.text_renderer.prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            );
+            self.text_renderer
+                .prepare(&self.device, &self.queue, &text_vertices);
             self.content_dirty = false;
         }
 
@@ -1283,38 +1221,38 @@ impl WindowState {
                 multiview_mask: None,
             });
             self.bg_renderer.render(&mut pass);
-            let _ = self
-                .text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass);
+            self.text_renderer.render(&self.font_atlas, &mut pass);
             for image in &self.images {
                 image.render(&mut pass);
             }
 
             let (_, cell_height, _) = scaled_metrics(self.scale_factor);
             let mut cursor_vertices = Vec::new();
-            let cursor_samples: Vec<(CursorPos, u8)> = std::iter::once((self.cursor.position, 220))
-                .chain(self.cursor.trail.iter().enumerate().map(|(idx, sample)| {
-                    let alpha = match idx {
-                        0 => 160,
-                        1 => 120,
-                        2 => 90,
-                        3 => 70,
-                        _ => 40,
-                    };
-                    (sample.position, alpha)
-                }))
-                .collect();
+            let cursor_samples: Vec<((f32, f32), u8)> =
+                std::iter::once((self.cursor.position, 220))
+                    .chain(self.cursor.trail.iter().enumerate().map(|(idx, sample)| {
+                        let alpha = match idx {
+                            0 => 160,
+                            1 => 120,
+                            2 => 90,
+                            3 => 70,
+                            _ => 40,
+                        };
+                        (sample.position, alpha)
+                    }))
+                    .collect();
 
-            for (index, (position, alpha)) in cursor_samples.iter().enumerate() {
-                if position.y < view_top || position.y >= view_top + view_rows {
+            for (index, (pos, alpha)) in cursor_samples.iter().enumerate() {
+                if pos.1 < view_top as f32 || pos.1 >= (view_top + view_rows) as f32 {
                     continue;
                 }
 
                 let progress = if index == 0 { 0.0 } else { index as f32 / 10.0 };
                 let width = 10.0_f32;
                 let inset = (width * (0.10 + progress * 0.10)).min(width * 0.35);
-                let x = (self.cached_cursor_x_px - inset * 0.25).max(0.0);
-                let y = (position.y - view_top) as f32 * cell_height + inset * 0.15;
+                let x = (pos.0 * cell_width - inset * 0.25).max(0.0);
+                let y = (pos.1 - view_top as f32) * cell_height + inset * 0.15;
+
                 let w = width - inset * 0.5;
                 let h = cell_height - inset * 0.25;
                 append_bg_quad(
@@ -1370,18 +1308,10 @@ impl WindowState {
         self.content_dirty = true;
         self.pump_terminal();
 
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.surface_config.width,
-                height: self.surface_config.height,
-            },
-        );
-
         let view_top = self.terminal.current_view_top();
         let view_rows = self.terminal.viewport_rows.min(HISTORY_ROWS - view_top);
-        self.ensure_line_buffers(self.terminal.viewport_rows, self.terminal.cols);
-        let (cell_width, cell_height, _) = scaled_metrics(self.scale_factor);
+
+        let (cell_width, cell_height, font_size) = scaled_metrics(self.scale_factor);
 
         {
             let mut row_spans = Vec::with_capacity(view_rows as usize);
@@ -1434,57 +1364,45 @@ impl WindowState {
                 row_texts.push(text);
             }
 
-            for (row, spans) in row_spans.iter().enumerate() {
-                let line_buffer = &mut self.line_buffers[row];
-                let default_attrs = Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgba(255, 255, 255, 255));
-                line_buffer.set_rich_text(
-                    &mut self.font_system,
-                    spans
-                        .iter()
-                        .map(|(text, attrs)| (text.as_str(), attrs.clone())),
-                    &default_attrs,
-                    Shaping::Basic,
-                    None,
-                );
-                line_buffer.shape_until_scroll(&mut self.font_system, false);
-            }
+            let face = ttf_parser::Face::parse(FONT_DATA, 4)
+                .unwrap_or_else(|_| ttf_parser::Face::parse(FONT_DATA, 0).unwrap());
+            let mut text_vertices = Vec::new();
 
-            let mut text_areas = Vec::with_capacity(view_rows as usize);
-            for (row, line_buffer) in self
-                .line_buffers
-                .iter()
-                .take(view_rows as usize)
-                .enumerate()
-            {
-                text_areas.push(TextArea {
-                    buffer: line_buffer,
-                    left: 0.0,
-                    top: row as f32 * cell_height,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.surface_config.width as i32,
-                        bottom: self.surface_config.height as i32,
-                    },
-                    default_color: Color::rgba(255, 255, 255, 255),
-                    custom_glyphs: &[],
-                });
+            for (row, spans) in row_spans.iter().enumerate() {
+                let mut x = 0.0;
+                let y = row as f32 * cell_height;
+                for (text, fg) in spans {
+                    let to_linear = |c: u8| (c as f32 / 255.0).powf(2.2);
+                    let color = [
+                        to_linear(fg.r),
+                        to_linear(fg.g),
+                        to_linear(fg.b),
+                        fg.a as f32 / 255.0,
+                    ];
+                    SDFTextRenderer::layout_text(
+                        &self.font_atlas,
+                        &face,
+                        text,
+                        x,
+                        y,
+                        cell_width,
+                        cell_height,
+                        font_size,
+                        self.surface_config.width as f32,
+                        self.surface_config.height as f32,
+                        color,
+                        &mut text_vertices,
+                    );
+                    for _c in text.chars() {
+                        x += cell_width;
+                    }
+                }
             }
 
             self.bg_renderer
                 .prepare(&self.device, &self.queue, &bg_vertices);
-            let _ = self.text_renderer.prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            );
+            self.text_renderer
+                .prepare(&self.device, &self.queue, &text_vertices);
         }
 
         let capture_view = capture_texture.create_view(&TextureViewDescriptor::default());
@@ -1512,9 +1430,7 @@ impl WindowState {
                 multiview_mask: None,
             });
             self.bg_renderer.render(&mut pass);
-            let _ = self
-                .text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass);
+            self.text_renderer.render(&self.font_atlas, &mut pass);
             for image in &self.images {
                 image.render(&mut pass);
             }
@@ -1652,8 +1568,8 @@ impl WindowState {
         frame.present();
     }
 
-    fn row_spans(&self, y: u32) -> Vec<(String, Attrs<'static>)> {
-        let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
+    fn row_spans(&self, y: u32) -> Vec<(String, Rgba)> {
+        let mut spans: Vec<(String, Rgba)> = Vec::new();
         let mut current_style: Option<CellStyle> = None;
 
         for x in 0..self.terminal.cols {
@@ -1670,12 +1586,12 @@ impl WindowState {
                 }
             } else {
                 current_style = Some(cell.style);
-                spans.push((display_ch.to_string(), attrs_from_style(cell.style)));
+                spans.push((display_ch.to_string(), cell.style.fg));
             }
         }
 
         if spans.is_empty() {
-            spans.push((" ".to_string(), attrs_from_style(CellStyle::default())));
+            spans.push((" ".to_string(), Rgba::WHITE));
         }
         spans
     }
@@ -1801,26 +1717,6 @@ fn grid_from_pixels(width: u32, height: u32, scale_factor: f64) -> GridSize {
     }
 }
 
-fn new_line_buffers(
-    font_system: &mut FontSystem,
-    rows: u32,
-    cols: u32,
-    scale_factor: f64,
-) -> Vec<Buffer> {
-    let (cell_width, cell_height, font_size) = scaled_metrics(scale_factor);
-    (0..rows)
-        .map(|_| {
-            let mut buffer = Buffer::new(font_system, Metrics::new(font_size, cell_height));
-            buffer.set_size(
-                font_system,
-                Some(cols as f32 * cell_width),
-                Some(cell_height),
-            );
-            buffer
-        })
-        .collect()
-}
-
 fn scaled_metrics(scale_factor: f64) -> (f32, f32, f32) {
     let scale = scale_factor.max(1.0) as f32;
     (CELL_WIDTH * scale, CELL_HEIGHT * scale, FONT_SIZE * scale)
@@ -1830,45 +1726,6 @@ fn lerp_u32(current: u32, target: u32, t: f32) -> u32 {
     let current = current as f32;
     let target = target as f32;
     (current + (target - current) * t).round().max(0.0) as u32
-}
-
-fn cursor_x_from_shaped_line(
-    buffer: &mut Buffer,
-    font_system: &mut FontSystem,
-    row_text: &str,
-    cursor_col: usize,
-    fallback_cell_width: f32,
-) -> f32 {
-    let byte_idx = row_text
-        .char_indices()
-        .nth(cursor_col)
-        .map(|(idx, _)| idx)
-        .unwrap_or(row_text.len());
-
-    let Some(layout) = buffer.line_layout(font_system, 0) else {
-        return cursor_col as f32 * fallback_cell_width;
-    };
-    let Some(line) = layout.last() else {
-        return cursor_col as f32 * fallback_cell_width;
-    };
-
-    if byte_idx == 0 {
-        return 0.0;
-    }
-
-    let mut x = 0.0;
-    for glyph in &line.glyphs {
-        if glyph.end <= byte_idx {
-            x = glyph.x + glyph.w;
-        } else {
-            break;
-        }
-    }
-    if x == 0.0 {
-        cursor_col as f32 * fallback_cell_width
-    } else {
-        x
-    }
 }
 
 pub fn is_custom_block(ch: char) -> bool {
@@ -2049,28 +1906,6 @@ fn append_custom_block(
     true
 }
 
-fn attrs_from_style(style: CellStyle) -> Attrs<'static> {
-    let weight = if style.bold {
-        Weight::BOLD
-    } else {
-        Weight::NORMAL
-    };
-    let slant = if style.italic {
-        Style::Italic
-    } else {
-        Style::Normal
-    };
-
-    Attrs::new()
-        .family(Family::Name("Menlo"))
-        .family(Family::Name("Monaco"))
-        .family(Family::Name("Courier New"))
-        .family(Family::Monospace)
-        .color(Color::rgba(style.fg.r, style.fg.g, style.fg.b, style.fg.a))
-        .weight(weight)
-        .style(slant)
-}
-
 fn append_bg_quad(
     out: &mut Vec<BgVertex>,
     width: f32,
@@ -2122,22 +1957,22 @@ fn append_bg_quad(
 }
 
 static ANSI_TABLE: [Rgba; 16] = [
-    Rgba::rgb(0, 0, 0),
-    Rgba::rgb(255, 0, 0),
-    Rgba::rgb(0, 255, 0),
-    Rgba::rgb(255, 255, 0),
-    Rgba::rgb(0, 0, 255),
-    Rgba::rgb(255, 0, 255),
-    Rgba::rgb(0, 255, 255),
-    Rgba::rgb(255, 255, 255),
-    Rgba::rgb(77, 77, 77),
-    Rgba::rgb(255, 77, 77),
-    Rgba::rgb(77, 255, 77),
-    Rgba::rgb(255, 255, 77),
-    Rgba::rgb(77, 77, 255),
-    Rgba::rgb(255, 77, 255),
-    Rgba::rgb(77, 255, 255),
-    Rgba::rgb(255, 255, 255),
+    Rgba::rgb(40, 44, 52),    // Black (One Dark variant)
+    Rgba::rgb(224, 108, 117), // Red
+    Rgba::rgb(152, 195, 121), // Green
+    Rgba::rgb(229, 192, 123), // Yellow
+    Rgba::rgb(97, 175, 239),  // Blue
+    Rgba::rgb(198, 120, 221), // Magenta
+    Rgba::rgb(86, 182, 194),  // Cyan
+    Rgba::rgb(171, 178, 191), // White
+    Rgba::rgb(92, 99, 112),   // Bright Black
+    Rgba::rgb(255, 125, 125), // Bright Red
+    Rgba::rgb(165, 255, 140), // Bright Green
+    Rgba::rgb(255, 220, 150), // Bright Yellow
+    Rgba::rgb(120, 195, 255), // Bright Blue
+    Rgba::rgb(220, 150, 255), // Bright Magenta
+    Rgba::rgb(110, 240, 255), // Bright Cyan
+    Rgba::rgb(255, 255, 255), // Bright White
 ];
 
 fn ansi_to_rgb(color: AnsiColor) -> Rgba {
@@ -2179,9 +2014,4 @@ fn index_to_color(index: u8) -> Rgba {
             Rgba::rgb(value, value, value)
         }
     }
-}
-
-fn load_embedded_fonts(font_system: &mut FontSystem) {
-    let db = font_system.db_mut();
-    db.load_font_data(include_bytes!("../assets/fonts/FiraCode.ttc").to_vec());
 }

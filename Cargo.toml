@@ -14,21 +14,21 @@ compact_str = { version = "0.9.0", default-features = false }
 crossbeam-channel = { version = "0.5.15", default-features = false, features = [
     "std",
 ] }
-bytemuck = { version = "1.24.0", default-features = false, features = [
+bytemuck = { version = "1.25.0", default-features = false, features = [
     "derive",
 ] }
-fontdb = { version = "0.23.0", default-features = false, features = ["fs"] }
 libc = { version = "0.2.183", default-features = false }
 pollster = { version = "0.4.0", default-features = false }
 vte = { version = "0.15.0", default-features = false }
-glyphon = { git = "https://github.com/RuairidhWilliamson/glyphon", branch = "wgpu-29" }
 wgpu = { version = "29.0.0", default-features = false, features = [
     "wgsl",
     "vulkan",
+    "vulkan-portability",
     "metal",
-    "dx12",
 ] }
 winit = { version = "0.31.0-beta.2", default-features = false }
+ttf-parser = "0.25.1"
+rayon = "1.11.0"
 
 [target.'cfg(target_family = "unix")'.dependencies]
 rustix-openpty = { version = "0.2.0", default-features = false }
