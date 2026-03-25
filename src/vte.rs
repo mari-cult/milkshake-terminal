@@ -1,5 +1,10 @@
-use bevy::math::UVec2;
 use compact_str::CompactString;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Position {
+    pub x: u32,
+    pub y: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamedColor {
@@ -55,7 +60,7 @@ pub enum AnsiColor {
 pub enum VteEvent {
     Echo(char),
     Backspace,
-    Goto(UVec2),
+    Goto(Position),
     GotoX(u32),
     GotoY(u32),
     LineUp(u32),
@@ -70,7 +75,11 @@ pub enum VteEvent {
     DisableAlternativeBuffer,
     EnableBracketedPaste,
     DisableBracketedPaste,
+    EnableFocusReporting,
+    DisableFocusReporting,
     ReportCursorPosition,
+    ReportDeviceAttributes,
+    ReportVersion,
     Reset,
     Bold,
     Dim,
@@ -90,6 +99,33 @@ pub enum VteEvent {
     ClearDown,
     ClearAll,
     ClearEverything,
+    EnableMouseMode(MouseMode),
+    DisableMouseMode(MouseMode),
+    InsertLine(u32),
+    DeleteLine(u32),
+    InsertCharacter(u32),
+    DeleteCharacter(u32),
+    EraseCharacter(u32),
+    FullReset,
+    ShowCursor,
+    HideCursor,
+    SetCursorStyle(u32),
+    SetMargin {
+        top: Option<u32>,
+        bottom: Option<u32>,
+    },
+    Index,
+    ReverseIndex,
+    NextLine,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseMode {
+    None,
+    Normal,       // 1000
+    ButtonMotion, // 1002
+    AnyMotion,    // 1003
+    Sgr,          // 1006 (Protocol)
 }
 
 pub trait VteHandler {
@@ -246,9 +282,7 @@ impl<T: VteHandler> Performer<T> {
                     }
                 }
 
-                _ => {
-                    bevy::prelude::info!("ignored SGR: {param}");
-                }
+                _ => {}
             }
             i += 1;
         }
@@ -320,9 +354,7 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
             b'\n' | b'\x0b' | b'\x0c' => self.state.vte_event(VteEvent::MoveDown(1)),
             0x0E => self.is_alt_charset = true,
             0x0F => self.is_alt_charset = false,
-            _ => {
-                bevy::prelude::info!("VTE execute: 0x{byte:02x}");
-            }
+            _ => {}
         }
     }
 
@@ -350,21 +382,22 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 self.state
                     .vte_event(VteEvent::Image(CompactString::from_utf8_lossy(image)));
             }
-            _ => {
-                bevy::prelude::info!("VTE OSC: {params:?}");
-            }
+            _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        bevy::prelude::info!("VTE ESC: intermediates={intermediates:?} byte=0x{byte:02x}");
         match (intermediates.first(), byte) {
             (None, b'7') => self.state.vte_event(VteEvent::SaveCursorPosition),
             (None, b'8') => self.state.vte_event(VteEvent::RestoreCursorPosition),
+            (None, b'D') => self.state.vte_event(VteEvent::Index),
+            (None, b'M') => self.state.vte_event(VteEvent::ReverseIndex),
+            (None, b'E') => self.state.vte_event(VteEvent::NextLine),
             (Some(b'('), b'0') => self.is_alt_charset = true,
             (Some(b'('), b'B') => self.is_alt_charset = false,
             (Some(b')'), b'0') => self.is_alt_charset = true,
             (Some(b')'), b'B') => self.is_alt_charset = false,
+            (None, b'c') => self.state.vte_event(VteEvent::FullReset),
             _ => {}
         }
     }
@@ -376,16 +409,13 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
         _ignore: bool,
         action: char,
     ) {
-        bevy::prelude::info!(
-            "CSI: action={action:?} params={params:?} intermediates={intermediates:?}"
-        );
-
         let mut flat_params = Vec::new();
         for p in params.iter() {
             for &subp in p {
                 flat_params.push(subp);
             }
         }
+
         let mut iter = flat_params.into_iter();
 
         match action {
@@ -405,13 +435,20 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 .vte_event(VteEvent::LineDown(next_axis(&mut iter))),
             'F' => self.state.vte_event(VteEvent::LineUp(next_axis(&mut iter))),
 
-            'G' => self
+            'G' | '`' => self
                 .state
                 .vte_event(VteEvent::GotoX(next_axis(&mut iter) - 1)),
+            'd' => self.state.vte_event(VteEvent::GotoY(next_axis(&mut iter))),
             'H' | 'f' => self
                 .state
                 .vte_event(VteEvent::Goto(next_position(&mut iter))),
 
+            'q' => {
+                let n = next(&mut iter).unwrap_or(0);
+                if intermediates.first() == Some(&b' ') {
+                    self.state.vte_event(VteEvent::SetCursorStyle(n as u32));
+                }
+            }
             'm' => {
                 let p_vec = iter.collect();
                 self.sgr_flat(p_vec);
@@ -436,26 +473,118 @@ impl<T: VteHandler> vte::Perform for Performer<T> {
                 Some(2) => self.state.vte_event(VteEvent::ClearLine),
                 _ => {}
             },
+            'L' => self
+                .state
+                .vte_event(VteEvent::InsertLine(next_axis(&mut iter))),
+            'M' => self
+                .state
+                .vte_event(VteEvent::DeleteLine(next_axis(&mut iter))),
+            '@' => self
+                .state
+                .vte_event(VteEvent::InsertCharacter(next_axis(&mut iter))),
+            'P' => self
+                .state
+                .vte_event(VteEvent::DeleteCharacter(next_axis(&mut iter))),
+            'X' => self
+                .state
+                .vte_event(VteEvent::EraseCharacter(next_axis(&mut iter))),
+            'r' => {
+                let top = iter.next().map(|v| v as u32);
+                let bottom = iter.next().map(|v| v as u32);
+                self.state.vte_event(VteEvent::SetMargin { top, bottom });
+            }
+
+            'c' => {
+                let is_tertiary = intermediates.first() == Some(&b'>');
+                if is_tertiary {
+                    self.state.vte_event(VteEvent::ReportVersion);
+                } else {
+                    self.state.vte_event(VteEvent::ReportDeviceAttributes);
+                }
+            }
 
             's' => self.state.vte_event(VteEvent::SaveCursorPosition),
             'u' => self.state.vte_event(VteEvent::RestoreCursorPosition),
             'h' | 'l' => {
-                bevy::prelude::info!("Private mode: {action} with params {params:?}");
+                let is_set = action == 'h';
+                let is_private = intermediates.first() == Some(&b'?');
+
+                if is_private {
+                    for param in iter {
+                        match param {
+                            1000 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::Normal));
+                                } else {
+                                    self.state
+                                        .vte_event(VteEvent::DisableMouseMode(MouseMode::Normal));
+                                }
+                            }
+                            1002 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableMouseMode(
+                                        MouseMode::ButtonMotion,
+                                    ));
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableMouseMode(
+                                        MouseMode::ButtonMotion,
+                                    ));
+                                }
+                            }
+                            1003 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::AnyMotion));
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableMouseMode(
+                                        MouseMode::AnyMotion,
+                                    ));
+                                }
+                            }
+                            1006 => {
+                                if is_set {
+                                    self.state
+                                        .vte_event(VteEvent::EnableMouseMode(MouseMode::Sgr));
+                                } else {
+                                    self.state
+                                        .vte_event(VteEvent::DisableMouseMode(MouseMode::Sgr));
+                                }
+                            }
+                            1049 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableAlternativeBuffer);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableAlternativeBuffer);
+                                }
+                            }
+                            1004 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableFocusReporting);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableFocusReporting);
+                                }
+                            }
+                            25 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::ShowCursor);
+                                } else {
+                                    self.state.vte_event(VteEvent::HideCursor);
+                                }
+                            }
+                            2004 => {
+                                if is_set {
+                                    self.state.vte_event(VteEvent::EnableBracketedPaste);
+                                } else {
+                                    self.state.vte_event(VteEvent::DisableBracketedPaste);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
-            _ => {
-                bevy::prelude::info!(
-                    "uncaught CSI: \\x1b[{}{action}",
-                    params
-                        .iter()
-                        .map(|p| p
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(":"))
-                        .collect::<Vec<_>>()
-                        .join(";")
-                );
-            }
+            _ => {}
         }
     }
 }
@@ -468,9 +597,9 @@ fn next_axis(iter: &mut impl Iterator<Item = u16>) -> u32 {
     next(iter).unwrap_or(1).max(1).into()
 }
 
-fn next_position(iter: &mut impl Iterator<Item = u16>) -> UVec2 {
+fn next_position(iter: &mut impl Iterator<Item = u16>) -> Position {
     let y = next_axis(iter);
     let x = next_axis(iter);
 
-    UVec2::new(x, y)
+    Position { x, y }
 }

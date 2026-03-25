@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: davidlattimore/wild-action@latest
-      - name: Install bevy deps
+      - name: Install deps
         run: |
           sudo apt update -y
           sudo apt install -y pkg-config libxkbcommon-dev libwayland-dev libasound2-dev libudev-dev
